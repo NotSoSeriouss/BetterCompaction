@@ -41,13 +41,27 @@
  *                        // compaction without restarting.
  *     "report": true,    // false → don't show the "Compaction completed in
  *                        // Xs ..." message after a compaction
- *     "thinking": "low"  // "low" (default) | "off" | "inherit" (the session's
- *                        // level — the built-in behavior). Defaults to "low":
- *                        // summaries are short structured output, and a high
- *                        // thinking level can hit the model's thinking cap
- *                        // mid-summary and stop the compaction. "off" omits
- *                        // the reasoning parameter entirely, same as the
- *                        // agent's own requests when session thinking is off.
+ *     "thinking": "low",  // "low" (default) | "off" | "inherit" (the session's
+ *                         // level — the built-in behavior). Defaults to "low":
+ *                         // summaries are short structured output, and a high
+ *                         // thinking level can hit the model's thinking cap
+ *                         // mid-summary and stop the compaction. "off" omits
+ *                         // the reasoning parameter entirely, same as the
+ *                         // agent's own requests when session thinking is off.
+ *     "lowThinkingBudget": 2048,  // max thinking tokens when compaction runs
+ *                         // at "low" — sent as a top-level OpenAI-compatible
+ *                         // field (thinkingBudgetField) so backends such as
+ *                         // llama.cpp cap the thinking phase and the model
+ *                         // doesn't overthink a short structured summary.
+ *                         // Falls back to the global thinkingBudgets.low,
+ *                         // then pi's default low budget (2048). 0 = no cap.
+ *     "thinkingBudgetField": "auto"  // "auto" (default) | "thinking_budget"
+ *                         // | "thinking_token_budget" | "thinking_budget_tokens"
+ *                         // — the top-level request field carrying the cap:
+ *                         // Qwen/DashScope/SGLang, vLLM, llama.cpp
+ *                         // respectively. "auto" honors the model's
+ *                         // compat.thinkingTokenBudgetField when set, otherwise
+ *                         // defaults to the llama.cpp field.
  *   }
  *
  * Both options can also be managed at runtime with the /bc command:
@@ -58,6 +72,8 @@
  *                             compaction takes over when disabled)
  *   /bc thinking low|off|inherit
  *                             set the summarization thinking level
+ *   /bc lowbudget <tokens>  set the max thinking tokens for "low" compaction
+ *                             (0 = no cap)
  *   /bc report on|off       show / hide the post-compaction report message
  *                             (timing and cache read)
  *
@@ -119,7 +135,8 @@ DO NOT ASK ME ANY OTHER QUESTIONS.
 </system>
 
 You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. Do NOT call any tools or functions. ONLY output the structured summary.
+
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.
 `;
 
 const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
@@ -223,6 +240,45 @@ function formatFileOperations(readFiles: string[], modifiedFiles: string[]): str
 }
 
 // ---------------------------------------------------------------------------
+// Low-thinking cap (OpenAI-compatible thinking-token budget)
+// ---------------------------------------------------------------------------
+
+/** Default cap on thinking tokens for "low" compaction (pi-ai's default "low" budget). */
+const DEFAULT_LOW_THINKING_BUDGET = 2048;
+/** Tokens always left for the summary itself under a shared response ceiling (pi-ai's MIN_ANSWER_TOKENS). */
+const MIN_ANSWER_TOKENS = 1024;
+
+/**
+ * Top-level OpenAI-compatible request fields that backends read for a
+ * reasoning-token cap — the same values as pi-ai's compat.thinkingTokenBudgetField:
+ * "thinking_budget_tokens" (llama.cpp), "thinking_token_budget" (vLLM),
+ * "thinking_budget" (Qwen/DashScope/SGLang).
+ */
+type ThinkingBudgetField = "thinking_budget" | "thinking_token_budget" | "thinking_budget_tokens";
+
+/**
+ * Which field carries the thinking cap. An explicit settings value wins;
+ * "auto" (default) honors the model's compat.thinkingTokenBudgetField when
+ * set, and otherwise falls back to the llama.cpp field (local llama.cpp is
+ * the backend this extension targets).
+ */
+function resolveThinkingBudgetField(
+	model: { compat?: unknown },
+	configured?: "auto" | ThinkingBudgetField,
+): ThinkingBudgetField {
+	if (configured && configured !== "auto") return configured;
+	const compatField = (model.compat as { thinkingTokenBudgetField?: string } | undefined)?.thinkingTokenBudgetField;
+	if (
+		compatField === "thinking_budget" ||
+		compatField === "thinking_token_budget" ||
+		compatField === "thinking_budget_tokens"
+	) {
+		return compatField;
+	}
+	return "thinking_budget_tokens";
+}
+
+// ---------------------------------------------------------------------------
 // pi settings
 //
 // pi's agent applies several settings to every LLM request (image blocking,
@@ -249,13 +305,31 @@ interface PiSettings {
 	websocketConnectTimeoutMs?: number;
 	transport?: "sse" | "websocket" | "websocket-cached" | "auto";
 	thinkingBudgets?: { minimal?: number; low?: number; medium?: number; high?: number };
-	betterCompaction?: {
-		enabled?: boolean;
-		/** Show the "Compaction completed in Xs ..." message after compaction. */
-		report?: boolean;
-		/** Thinking level for the summarization call. */
-		thinking?: "low" | "off" | "inherit";
-	};
+	betterCompaction?: BetterCompactionSettings;
+}
+
+/** The betterCompaction section of pi's settings. */
+interface BetterCompactionSettings {
+	enabled?: boolean;
+	/** Show the "Compaction completed in Xs ..." message after compaction. */
+	report?: boolean;
+	/** Thinking level for the summarization call. */
+	thinking?: "low" | "off" | "inherit";
+	/**
+	 * Max thinking tokens for the summarization call when its effective
+	 * thinking level is "low". Sent as a top-level OpenAI-compatible request
+	 * field (see thinkingBudgetField) via samplingParams, so backends such as
+	 * llama.cpp cap the thinking phase. Falls back to the global
+	 * thinkingBudgets.low, then DEFAULT_LOW_THINKING_BUDGET. 0 disables the cap.
+	 */
+	lowThinkingBudget?: number;
+	/**
+	 * Top-level request field carrying the thinking cap (same values as
+	 * pi-ai's compat.thinkingTokenBudgetField). "auto" (default) honors the
+	 * model's compat setting when set, otherwise uses the llama.cpp field.
+	 * Only OpenAI-compatible backends apply the cap; other APIs ignore it.
+	 */
+	thinkingBudgetField?: "auto" | "thinking_budget" | "thinking_token_budget" | "thinking_budget_tokens";
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -308,14 +382,22 @@ function loadPiSettings(cwd: string): PiSettingsSource {
 }
 
 /**
+ * Effective max thinking tokens for the summarization call at thinking level
+ * "low", or 0 for no cap. betterCompaction.lowThinkingBudget wins (including
+ * an explicit 0), then the global thinkingBudgets.low, then the default.
+ */
+function lowThinkingCap(settings: PiSettings): number {
+	const budget =
+		settings.betterCompaction?.lowThinkingBudget ?? settings.thinkingBudgets?.low ?? DEFAULT_LOW_THINKING_BUDGET;
+	return typeof budget === "number" && Number.isFinite(budget) && budget > 0 ? Math.floor(budget) : 0;
+}
+
+/**
  * Update the betterCompaction section in the settings file that currently
  * provides it (project wins over global), so /bc always edits the file that
  * is actually in effect. Returns the path written.
  */
-function writeBetterCompactionSetting(
-	cwd: string,
-	patch: { enabled?: boolean; report?: boolean; thinking?: "low" | "off" | "inherit" },
-): string {
+function writeBetterCompactionSetting(cwd: string, patch: Partial<BetterCompactionSettings>): string {
 	const { betterCompactionSourcePath } = loadPiSettings(cwd);
 	const current = readSettingsFile(betterCompactionSourcePath);
 	const section = isObject(current.betterCompaction) ? { ...current.betterCompaction } : {};
@@ -378,9 +460,10 @@ export default function (pi: ExtensionAPI) {
 
 	// /bc — inspect and control this extension's options.
 	pi.registerCommand("bc", {
-		description: "Better Compaction: /bc [on|off|thinking low|off|inherit|report on|off] — show or change compaction options",
+		description:
+			"Better Compaction: /bc [on|off|thinking low|off|inherit|lowbudget <tokens>|report on|off] — show or change compaction options",
 		getArgumentCompletions: (prefix) => {
-			const options = ["on", "off", "thinking", "report"];
+			const options = ["on", "off", "thinking", "lowbudget", "report"];
 			const filtered = options.filter((o) => o.startsWith(prefix.toLowerCase()));
 			return filtered.length > 0
 				? filtered.map((o) => ({ value: o, label: o, description: "Better Compaction option" }))
@@ -388,16 +471,21 @@ export default function (pi: ExtensionAPI) {
 		},
 		handler: async (args, ctx) => {
 			const { settings, betterCompactionSource, betterCompactionSourcePath } = loadPiSettings(ctx.cwd);
-			const section = settings.betterCompaction ?? {};
+			const section: BetterCompactionSettings = settings.betterCompaction ?? {};
 			const enabled = section.enabled !== false;
 			const report = section.report !== false;
 			const thinking = section.thinking ?? "low";
 			const arg = args.trim().toLowerCase();
 
 			if (arg === "") {
+				const cap = lowThinkingCap(settings);
+				const capInfo =
+					cap > 0
+						? ` | low thinking cap: ${cap} (${resolveThinkingBudgetField(ctx.model ?? {}, section.thinkingBudgetField)})`
+						: "";
 				ctx.ui.notify(
 					`Better Compaction: ${enabled ? "enabled" : "disabled"} | compaction thinking: ${thinking} | ` +
-						`report: ${report ? "on" : "off"} | session thinking: ${ctx.thinkingLevel ?? "off"} | ` +
+						`report: ${report ? "on" : "off"} | session thinking: ${ctx.thinkingLevel ?? "off"}${capInfo} | ` +
 						`config: ${betterCompactionSource} (${betterCompactionSourcePath})`,
 				);
 				return;
@@ -423,6 +511,20 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
+			if (arg.startsWith("lowbudget")) {
+				const raw = arg.split(/\s+/)[1];
+				const value = raw === undefined ? Number.NaN : Number(raw);
+				if (!Number.isInteger(value) || value < 0) {
+					ctx.ui.notify("Better Compaction: usage: /bc lowbudget <tokens> (0 = no cap)", "error");
+					return;
+				}
+				const path = writeBetterCompactionSetting(ctx.cwd, { lowThinkingBudget: value });
+				ctx.ui.notify(
+					`Better Compaction: low-thinking cap set to ${value === 0 ? "off" : `${value} tokens`} ` +
+						`(written to ${path}; applies at the next compaction)`,
+				);
+				return;
+			}
 			if (arg.startsWith("report")) {
 				const value = arg.split(/\s+/)[1];
 				if (value !== "on" && value !== "off") {
@@ -436,7 +538,10 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			ctx.ui.notify("Better Compaction: usage: /bc [on|off|thinking low|off|inherit|report on|off]", "error");
+			ctx.ui.notify(
+				"Better Compaction: usage: /bc [on|off|thinking low|off|inherit|lowbudget <tokens>|report on|off]",
+				"error",
+			);
 		},
 	});
 
@@ -536,6 +641,7 @@ export default function (pi: ExtensionAPI) {
 			websocketConnectTimeoutMs?: number;
 			transport?: PiSettings["transport"];
 			thinkingBudgets?: PiSettings["thinkingBudgets"];
+			samplingParams?: Record<string, unknown>;
 		} = {
 			maxTokens,
 			signal,
@@ -563,11 +669,30 @@ export default function (pi: ExtensionAPI) {
 		// parameter — the same request the agent sends when session thinking
 		// is off — and "inherit" restores the built-in behavior.
 		const thinkingChoice = settings.betterCompaction?.thinking ?? "low";
+		let effectiveReasoning: Exclude<typeof ctx.thinkingLevel, "off"> | undefined;
 		if (model.reasoning) {
 			if (thinkingChoice === "low") {
 				streamOptions.reasoning = "low";
+				effectiveReasoning = "low";
 			} else if (thinkingChoice === "inherit" && ctx.thinkingLevel && ctx.thinkingLevel !== "off") {
 				streamOptions.reasoning = ctx.thinkingLevel;
+				effectiveReasoning = ctx.thinkingLevel;
+			}
+		}
+		// Cap the thinking phase when the summarization runs at "low": the
+		// summary is short structured output, so an uncapped thinking phase can
+		// dominate the response on local models. The cap goes out as a top-level
+		// OpenAI-compatible field via samplingParams — pi-ai merges it into the
+		// request body last (so it wins over any model-level value) and only
+		// OpenAI-compatible adapters apply it, so calls on other APIs are
+		// unchanged.
+		if (effectiveReasoning === "low") {
+			// Leave room for the summary itself under the shared response ceiling.
+			const capped = Math.min(lowThinkingCap(settings), Math.max(0, maxTokens - MIN_ANSWER_TOKENS));
+			if (capped > 0) {
+				streamOptions.samplingParams = {
+					[resolveThinkingBudgetField(model, settings.betterCompaction?.thinkingBudgetField)]: capped,
+				};
 			}
 		}
 

@@ -90,6 +90,7 @@ pi update --extensions   # reconcile to the pinned ref later
 | `/bc on` | Enable the extension (default) |
 | `/bc off` | Disable the extension — pi's built-in compaction takes over |
 | `/bc thinking low\|off\|inherit` | Set the summarization thinking level |
+| `/bc lowbudget <tokens>` | Set the max thinking tokens sent when compaction runs at "low" (0 = no cap) |
 | `/bc report on\|off` | Show / hide the post-compaction report message (timing and cache read) |
 
 `/bc` writes to the settings file that **currently provides** the
@@ -107,7 +108,9 @@ compaction time, so they apply at the **next compaction** without restarting.
   "betterCompaction": {
     "enabled": true,
     "report": true,
-    "thinking": "low"
+    "thinking": "low",
+    "lowThinkingBudget": 2048,
+    "thinkingBudgetField": "auto"
   }
 }
 ```
@@ -117,6 +120,28 @@ compaction time, so they apply at the **next compaction** without restarting.
 | `enabled` | `true` | `false` → the extension stays silent and pi's built-in compaction runs instead |
 | `report` | `true` | `false` → don't send the "Compaction completed in Xs ..." message after a compaction (toggle with `/bc report off`) |
 | `thinking` | `"low"` | Thinking level for the summarization call: `"low"` (short structured summaries rarely need more, and a high level can hit the model's thinking cap mid-summary), `"off"` (omits the reasoning parameter — identical to the agent's own requests when session thinking is off), `"inherit"` (follow the session's level — the built-in behavior) |
+| `lowThinkingBudget` | `2048` | Max thinking tokens sent when the summarization runs at thinking level `"low"` (also with `"inherit"` when the session level is low). Falls back to the global `thinkingBudgets.low`, then 2048. `0` disables the cap (toggle with `/bc lowbudget`) |
+| `thinkingBudgetField` | `"auto"` | The top-level OpenAI-compatible request field that carries the cap: `"thinking_budget_tokens"` (llama.cpp), `"thinking_token_budget"` (vLLM), `"thinking_budget"` (Qwen/DashScope/SGLang). `"auto"` uses the model's `compat.thinkingTokenBudgetField` when set, otherwise the llama.cpp field |
+
+### How the "low" thinking cap works
+
+Summaries are short structured output, but a reasoning model with thinking
+enabled will still burn a long thinking phase on them — on local backends the
+thinking phase dominates compaction time and can hit the model's thinking cap
+mid-summary. So when the summarization call runs at thinking level `"low"`
+(the default), the extension also sends a max-thinking-tokens cap as a
+top-level field of the OpenAI-compatible request body, e.g.
+`"thinking_budget_tokens": 2048` for a local llama.cpp server. The cap is
+injected through pi-ai's `samplingParams` pass-through, which merges the field
+into the request body last (so it wins over any model-level value) and only
+OpenAI-compatible adapters apply — calls on other APIs (Anthropic, ...) are
+unchanged.
+
+The value is `lowThinkingBudget` (default 2048, falling back to the global
+`thinkingBudgets.low`), clamped so at least 1024 tokens remain for the summary
+itself under the response ceiling. Note that llama.cpp only honors the
+per-request field when the server was started without `--reasoning-budget`
+(a server-level budget always wins).
 
 ### Notifications
 
@@ -131,7 +156,8 @@ compaction time, so they apply at the **next compaction** without restarting.
 The extension also mirrors the settings pi applies to normal agent requests
 (`images.blockImages`, `retry.*`, provider timeouts, transport, thinking
 budgets), reading the same settings files pi merges, so the summarization
-request stays identical to what the agent sends.
+request stays identical to what the agent sends — plus the "low" thinking
+cap described above, which the agent's own requests don't carry.
 
 ## Repository layout
 
