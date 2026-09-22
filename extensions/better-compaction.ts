@@ -39,6 +39,8 @@
  *                        // compaction runs instead. Settings are read at
  *                        // compaction time, so a change applies at the next
  *                        // compaction without restarting.
+ *     "report": true,    // false → don't show the "Compaction completed in
+ *                        // Xs ..." message after a compaction
  *     "thinking": "low"  // "low" (default) | "off" | "inherit" (the session's
  *                        // level — the built-in behavior). Defaults to "low":
  *                        // summaries are short structured output, and a high
@@ -56,6 +58,8 @@
  *                             compaction takes over when disabled)
  *   /bc thinking low|off|inherit
  *                             set the summarization thinking level
+ *   /bc report on|off       show / hide the post-compaction report message
+ *                             (timing and cache read)
  *
  * /bc writes to the settings file that currently provides the
  * betterCompaction section (project file if it defines one, otherwise the
@@ -231,6 +235,8 @@ interface PiSettings {
 	thinkingBudgets?: { minimal?: number; low?: number; medium?: number; high?: number };
 	betterCompaction?: {
 		enabled?: boolean;
+		/** Show the "Compaction completed in Xs ..." message after compaction. */
+		report?: boolean;
 		/** Thinking level for the summarization call. */
 		thinking?: "low" | "off" | "inherit";
 	};
@@ -292,7 +298,7 @@ function loadPiSettings(cwd: string): PiSettingsSource {
  */
 function writeBetterCompactionSetting(
 	cwd: string,
-	patch: { enabled?: boolean; thinking?: "low" | "off" | "inherit" },
+	patch: { enabled?: boolean; report?: boolean; thinking?: "low" | "off" | "inherit" },
 ): string {
 	const { betterCompactionSourcePath } = loadPiSettings(cwd);
 	const current = readSettingsFile(betterCompactionSourcePath);
@@ -356,9 +362,9 @@ export default function (pi: ExtensionAPI) {
 
 	// /bc — inspect and control this extension's options.
 	pi.registerCommand("bc", {
-		description: "Better Compaction: /bc [on|off|thinking low|off|inherit] — show or change compaction options",
+		description: "Better Compaction: /bc [on|off|thinking low|off|inherit|report on|off] — show or change compaction options",
 		getArgumentCompletions: (prefix) => {
-			const options = ["on", "off", "thinking"];
+			const options = ["on", "off", "thinking", "report"];
 			const filtered = options.filter((o) => o.startsWith(prefix.toLowerCase()));
 			return filtered.length > 0
 				? filtered.map((o) => ({ value: o, label: o, description: "Better Compaction option" }))
@@ -368,14 +374,15 @@ export default function (pi: ExtensionAPI) {
 			const { settings, betterCompactionSource, betterCompactionSourcePath } = loadPiSettings(ctx.cwd);
 			const section = settings.betterCompaction ?? {};
 			const enabled = section.enabled !== false;
+			const report = section.report !== false;
 			const thinking = section.thinking ?? "low";
 			const arg = args.trim().toLowerCase();
 
 			if (arg === "") {
 				ctx.ui.notify(
 					`Better Compaction: ${enabled ? "enabled" : "disabled"} | compaction thinking: ${thinking} | ` +
-						`session thinking: ${ctx.thinkingLevel ?? "off"} | config: ${betterCompactionSource} ` +
-						`(${betterCompactionSourcePath})`,
+						`report: ${report ? "on" : "off"} | session thinking: ${ctx.thinkingLevel ?? "off"} | ` +
+						`config: ${betterCompactionSource} (${betterCompactionSourcePath})`,
 				);
 				return;
 			}
@@ -400,7 +407,20 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			ctx.ui.notify("Better Compaction: usage: /bc [on|off|thinking low|off|inherit]", "error");
+			if (arg.startsWith("report")) {
+				const value = arg.split(/\s+/)[1];
+				if (value !== "on" && value !== "off") {
+					ctx.ui.notify("Better Compaction: usage: /bc report on|off", "error");
+					return;
+				}
+				const path = writeBetterCompactionSetting(ctx.cwd, { report: value === "on" });
+				ctx.ui.notify(
+					`Better Compaction: post-compaction report ${value === "on" ? "enabled" : "disabled"} ` +
+						`(written to ${path}; applies at the next compaction)`,
+				);
+				return;
+			}
+			ctx.ui.notify("Better Compaction: usage: /bc [on|off|thinking low|off|inherit|report on|off]", "error");
 		},
 	});
 
@@ -616,7 +636,8 @@ export default function (pi: ExtensionAPI) {
 			details.push(`${k(response.usage.cacheRead)} tokens from cache`);
 		}
 		const suffix = details.length > 0 ? ` (${details.join(", ")})` : "";
-		if (ctx.hasUI) {
+		// The post-compaction report can be switched off with report=false.
+		if (settings.betterCompaction?.report !== false && ctx.hasUI) {
 			ctx.ui.notify(`Compaction completed in ${(timing.totalMs / 1000).toFixed(1)}s${suffix}.`);
 		}
 

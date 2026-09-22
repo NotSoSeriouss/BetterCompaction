@@ -104,6 +104,7 @@ pi update --extensions   # reconcile to the pinned ref later
 | `/bc on` | Enable the extension (default) |
 | `/bc off` | Disable the extension — pi's built-in compaction takes over |
 | `/bc thinking low\|off\|inherit` | Set the summarization thinking level |
+| `/bc report on\|off` | Show / hide the post-compaction report message (timing and cache read) |
 
 `/bc` writes to the settings file that **currently provides** the
 `betterCompaction` section — the project file (`.pi/settings.json`) if it
@@ -119,6 +120,7 @@ compaction time, so they apply at the **next compaction** without restarting.
 {
   "betterCompaction": {
     "enabled": true,
+    "report": true,
     "thinking": "low"
   }
 }
@@ -127,11 +129,12 @@ compaction time, so they apply at the **next compaction** without restarting.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | `false` → the extension stays silent and pi's built-in compaction runs instead |
+| `report` | `true` | `false` → don't send the "Compaction completed in Xs ..." message after a compaction (toggle with `/bc report off`) |
 | `thinking` | `"low"` | Thinking level for the summarization call: `"low"` (short structured summaries rarely need more, and a high level can hit the model's thinking cap mid-summary), `"off"` (omits the reasoning parameter — identical to the agent's own requests when session thinking is off), `"inherit"` (follow the session's level — the built-in behavior) |
 
 ### Notifications
 
-- **After each successful compaction:**
+- **After each successful compaction** (disable with `/bc report off`):
   `Compaction completed in 42.3s (35.1s thinking, 7.2s generating, 94.4k tokens from cache).`
   The thinking breakdown is shown only when the model actually thought; the
   cache figure shows how many tokens the prefix cache served.
