@@ -34,7 +34,7 @@
  *
  * Configuration (pi's settings.json, global or project; project wins):
  *
- *   "appendCompaction": {
+ *   "betterCompaction": {
  *     "enabled": true,   // false → extension stays silent, pi's built-in
  *                        // compaction runs instead. Settings are read at
  *                        // compaction time, so a change applies at the next
@@ -58,7 +58,7 @@
  *                             set the summarization thinking level
  *
  * /bc writes to the settings file that currently provides the
- * appendCompaction section (project file if it defines one, otherwise the
+ * betterCompaction section (project file if it defines one, otherwise the
  * global file), so it always edits the file that is in effect.
  *
  * When compaction runs without thinking, a warning is shown once per session
@@ -229,7 +229,7 @@ interface PiSettings {
 	websocketConnectTimeoutMs?: number;
 	transport?: "sse" | "websocket" | "websocket-cached" | "auto";
 	thinkingBudgets?: { minimal?: number; low?: number; medium?: number; high?: number };
-	appendCompaction?: {
+	betterCompaction?: {
 		enabled?: boolean;
 		/** Thinking level for the summarization call. */
 		thinking?: "low" | "off" | "inherit";
@@ -268,39 +268,39 @@ function projectSettingsPath(cwd: string): string {
 
 interface PiSettingsSource {
 	settings: PiSettings;
-	/** Which file currently provides the effective appendCompaction config. */
-	appendCompactionSource: "global" | "project";
-	appendCompactionSourcePath: string;
+	/** Which file currently provides the effective betterCompaction config. */
+	betterCompactionSource: "global" | "project";
+	betterCompactionSourcePath: string;
 }
 
 /** Read pi's global + project settings the same way SettingsManager does. */
 function loadPiSettings(cwd: string): PiSettingsSource {
 	const globalSettings = readSettingsFile(globalSettingsPath());
 	const projectSettings = readSettingsFile(projectSettingsPath(cwd));
-	const fromProject = "appendCompaction" in projectSettings;
+	const fromProject = "betterCompaction" in projectSettings;
 	return {
 		settings: mergeSettings(globalSettings, projectSettings) as PiSettings,
-		appendCompactionSource: fromProject ? "project" : "global",
-		appendCompactionSourcePath: fromProject ? projectSettingsPath(cwd) : globalSettingsPath(),
+		betterCompactionSource: fromProject ? "project" : "global",
+		betterCompactionSourcePath: fromProject ? projectSettingsPath(cwd) : globalSettingsPath(),
 	};
 }
 
 /**
- * Update the appendCompaction section in the settings file that currently
+ * Update the betterCompaction section in the settings file that currently
  * provides it (project wins over global), so /bc always edits the file that
  * is actually in effect. Returns the path written.
  */
-function writeAppendCompactionSetting(
+function writeBetterCompactionSetting(
 	cwd: string,
 	patch: { enabled?: boolean; thinking?: "low" | "off" | "inherit" },
 ): string {
-	const { appendCompactionSourcePath } = loadPiSettings(cwd);
-	const current = readSettingsFile(appendCompactionSourcePath);
-	const section = isObject(current.appendCompaction) ? { ...current.appendCompaction } : {};
+	const { betterCompactionSourcePath } = loadPiSettings(cwd);
+	const current = readSettingsFile(betterCompactionSourcePath);
+	const section = isObject(current.betterCompaction) ? { ...current.betterCompaction } : {};
 	Object.assign(section, patch);
-	current.appendCompaction = section;
-	writeFileSync(appendCompactionSourcePath, JSON.stringify(current, null, 2) + "\n");
-	return appendCompactionSourcePath;
+	current.betterCompaction = section;
+	writeFileSync(betterCompactionSourcePath, JSON.stringify(current, null, 2) + "\n");
+	return betterCompactionSourcePath;
 }
 
 type LlmMessage = ReturnType<typeof convertToLlm>[number];
@@ -342,8 +342,8 @@ export default function (pi: ExtensionAPI) {
 	// Warn once per session when compaction will run without thinking.
 	pi.on("session_start", (_event, ctx) => {
 		const { settings } = loadPiSettings(ctx.cwd);
-		if (settings.appendCompaction?.enabled === false) return;
-		const thinking = settings.appendCompaction?.thinking ?? "low";
+		if (settings.betterCompaction?.enabled === false) return;
+		const thinking = settings.betterCompaction?.thinking ?? "low";
 		const noThinking =
 			thinking === "off" || (thinking === "inherit" && (!ctx.thinkingLevel || ctx.thinkingLevel === "off"));
 		if (noThinking && ctx.hasUI) {
@@ -365,8 +365,8 @@ export default function (pi: ExtensionAPI) {
 				: null;
 		},
 		handler: async (args, ctx) => {
-			const { settings, appendCompactionSource, appendCompactionSourcePath } = loadPiSettings(ctx.cwd);
-			const section = settings.appendCompaction ?? {};
+			const { settings, betterCompactionSource, betterCompactionSourcePath } = loadPiSettings(ctx.cwd);
+			const section = settings.betterCompaction ?? {};
 			const enabled = section.enabled !== false;
 			const thinking = section.thinking ?? "low";
 			const arg = args.trim().toLowerCase();
@@ -374,13 +374,13 @@ export default function (pi: ExtensionAPI) {
 			if (arg === "") {
 				ctx.ui.notify(
 					`Better Compaction: ${enabled ? "enabled" : "disabled"} | compaction thinking: ${thinking} | ` +
-						`session thinking: ${ctx.thinkingLevel ?? "off"} | config: ${appendCompactionSource} ` +
-						`(${appendCompactionSourcePath})`,
+						`session thinking: ${ctx.thinkingLevel ?? "off"} | config: ${betterCompactionSource} ` +
+						`(${betterCompactionSourcePath})`,
 				);
 				return;
 			}
 			if (arg === "on" || arg === "off") {
-				const path = writeAppendCompactionSetting(ctx.cwd, { enabled: arg === "on" });
+				const path = writeBetterCompactionSetting(ctx.cwd, { enabled: arg === "on" });
 				ctx.ui.notify(
 					`Better Compaction ${arg === "on" ? "enabled" : "disabled"} (written to ${path}; ` +
 						`applies at the next compaction)`,
@@ -393,7 +393,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("Better Compaction: usage: /bc thinking low|off|inherit", "error");
 					return;
 				}
-				const path = writeAppendCompactionSetting(ctx.cwd, { thinking: value });
+				const path = writeBetterCompactionSetting(ctx.cwd, { thinking: value });
 				ctx.ui.notify(
 					`Better Compaction: compaction thinking set to ${value} (written to ${path}; ` +
 						`applies at the next compaction)`,
@@ -412,7 +412,7 @@ export default function (pi: ExtensionAPI) {
 		// The whole extension can be switched off via settings; pi's built-in
 		// compaction takes over. Read at compaction time so no restart is needed.
 		const { settings } = loadPiSettings(ctx.cwd);
-		if (settings.appendCompaction?.enabled === false) return;
+		if (settings.betterCompaction?.enabled === false) return;
 
 		// 1. Rebuild the prefix of pi's LLM request up to the compaction cut.
 		//
@@ -526,7 +526,7 @@ export default function (pi: ExtensionAPI) {
 		// mid-summary (stopping the compaction). "off" omits the reasoning
 		// parameter — the same request the agent sends when session thinking
 		// is off — and "inherit" restores the built-in behavior.
-		const thinkingChoice = settings.appendCompaction?.thinking ?? "low";
+		const thinkingChoice = settings.betterCompaction?.thinking ?? "low";
 		if (model.reasoning) {
 			if (thinkingChoice === "low") {
 				streamOptions.reasoning = "low";

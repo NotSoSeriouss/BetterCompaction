@@ -1,7 +1,7 @@
 {
   "name": "better-compaction",
   "version": "0.1.0",
-  "description": "Cache-friendly context compaction for pi — summarizes by appending to the real conversation prefix so KV/prefix caches are reused",
+  "description": "Context compaction for pi — summarizes by appending the compaction instruction to the real conversation, so the backend's prompt cache is reused",
   "keywords": [
     "pi-package",
     "pi",
