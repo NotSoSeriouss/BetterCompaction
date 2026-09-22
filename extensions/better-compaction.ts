@@ -77,8 +77,10 @@
  * kept-messages rebuild. The extension only supplies the summary via the
  * `session_before_compact` event; pi does the rest with its normal path.
  *
- * Note: the summarization model now sees the conversation as a live dialogue,
- * so the appended prompt explicitly forbids continuing the conversation.
+ * Note: the summarization model now sees the conversation as a live dialogue
+ * full of real tool calls, so the appended prompt explicitly forbids
+ * continuing the conversation and calling tools. Models that attempt a tool
+ * call anyway are handled gracefully (see the validation step).
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -104,7 +106,7 @@ import { contentText, normalizeContext, retryAssistantCall } from "@earendil-wor
  */
 const SUMMARY_ROLE = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
 
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation. Do NOT call any tools or functions. ONLY output the structured summary.`;
 
 const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
@@ -561,59 +563,66 @@ export default function (pi: ExtensionAPI) {
 		// final attempt can be timed: thinking time is the sum of
 		// thinking_start→thinking_end spans, the rest is generation.
 		let timing = { totalMs: 0, thinkingMs: 0 };
-		const response = await retryAssistantCall(
-			async () => {
-				const t0 = Date.now();
-				let thinkingMs = 0;
-				let spanStart: number | null = null;
-				let message: AssistantMessage | undefined;
-				const stream = await ctx.modelRegistry.streamSimple(model, requestContext, streamOptions);
-				for await (const event of stream) {
-					if (event.type === "thinking_start" && spanStart === null) {
-						spanStart = Date.now();
-					} else if (event.type === "thinking_end") {
-						if (spanStart !== null) {
-							thinkingMs += Date.now() - spanStart;
-							spanStart = null;
-						}
-					} else if (event.type === "done") {
-						message = event.message;
-					} else if (event.type === "error") {
-						message = event.error;
+		const produce = async () => {
+			const t0 = Date.now();
+			let thinkingMs = 0;
+			let spanStart: number | null = null;
+			let message: AssistantMessage | undefined;
+			const stream = await ctx.modelRegistry.streamSimple(model, requestContext, streamOptions);
+			for await (const event of stream) {
+				if (event.type === "thinking_start" && spanStart === null) {
+					spanStart = Date.now();
+				} else if (event.type === "thinking_end") {
+					if (spanStart !== null) {
+						thinkingMs += Date.now() - spanStart;
+						spanStart = null;
 					}
+				} else if (event.type === "done") {
+					message = event.message;
+				} else if (event.type === "error") {
+					message = event.error;
 				}
-				if (spanStart !== null) thinkingMs += Date.now() - spanStart; // unclosed span
-				timing = { totalMs: Date.now() - t0, thinkingMs };
-				if (!message) throw new Error("Summarization stream ended without a result");
-				return message;
-			},
-			{
-				enabled: settings.retry?.enabled ?? true,
-				maxRetries: settings.retry?.maxRetries ?? 3,
-				baseDelayMs: settings.retry?.baseDelayMs ?? 2000,
-				maxAgentDelayMs: settings.retry?.maxAgentDelayMs ?? 60_000,
-			},
-			signal,
-		);
+			}
+			if (spanStart !== null) thinkingMs += Date.now() - spanStart; // unclosed span
+			timing = { totalMs: Date.now() - t0, thinkingMs };
+			if (!message) throw new Error("Summarization stream ended without a result");
+			return message;
+		};
+		const retryPolicy = {
+			enabled: settings.retry?.enabled ?? true,
+			maxRetries: settings.retry?.maxRetries ?? 3,
+			baseDelayMs: settings.retry?.baseDelayMs ?? 2000,
+			maxAgentDelayMs: settings.retry?.maxAgentDelayMs ?? 60_000,
+		};
+		let response = await retryAssistantCall(produce, retryPolicy, signal);
 
 		// 4. Validate like the built-in compaction does: never persist a
 		//    partial or failed summary.
-		if (response.stopReason === "aborted") {
-			throw new Error("Compaction aborted");
-		}
-		if (response.stopReason === "error") {
-			throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
-		}
-		if (response.stopReason === "length") {
-			throw new Error("Summarization failed: generation hit the token cap and the summary is incomplete");
-		}
-		// The request carries the session's real tool set (needed for the prefix
-		// to stay identical to the agent's request), so the summarizer CAN call
-		// tools. Never persist a summary that tried to continue the work.
-		if (response.content.some((block) => block.type === "toolCall")) {
-			throw new Error("Summarization attempted to call a tool");
+		//
+		// The summarized conversation is full of real tool calls, so some
+		// models — especially smaller local ones — attempt to call a tool
+		// instead of just summarizing, despite the prompt forbidding it.
+		// Recover: keep the summary text when there is one, otherwise retry
+		// the identical request once before giving up.
+		const hasToolCall = (r: AssistantMessage) => r.content.some((b) => b.type === "toolCall");
+		const validateResponse = (r: AssistantMessage) => {
+			if (r.stopReason === "aborted") throw new Error("Compaction aborted");
+			if (r.stopReason === "error") {
+				throw new Error(`Summarization failed: ${r.errorMessage || "Unknown error"}`);
+			}
+			if (r.stopReason === "length" && !hasToolCall(r)) {
+				throw new Error("Summarization failed: generation hit the token cap and the summary is incomplete");
+			}
+		};
+		validateResponse(response);
+		if (hasToolCall(response) && !contentText(response.content).trim()) {
+			response = await retryAssistantCall(produce, retryPolicy, signal);
+			validateResponse(response);
 		}
 		const summaryText = contentText(response.content).trim();
+		if (hasToolCall(response) && !summaryText) {
+			throw new Error("Summarization attempted to call a tool");
+		}
 		if (!summaryText) {
 			throw new Error("Summarization returned no text");
 		}
