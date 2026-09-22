@@ -57,6 +57,10 @@ and to **about 2 minutes** with thinking disabled (`/bc thinking off`).
 
 ## Install
 
+### Requirements
+
+The extension requires **pi** `0.87.1` or [higher](https://github.com/earendil-works/pi/releases).
+
 ### Option A — single file (simplest)
 
 Copy the extension file into your pi extensions directory:
