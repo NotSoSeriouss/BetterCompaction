@@ -70,13 +70,13 @@ Restart pi (or start a new session). Done.
 ### Option B — as a pi package (local path)
 
 ```bash
-pi install /absolute/path/to/better-compaction
+pi install /absolute/path/to/BetterCompaction
 ```
 
 ### Option C — as a pi package (git)
 
 ```bash
-pi install git:github.com/NotSoSeriouss/BetterCompaction@v1
+pi install git:github.com/NotSoSeriouss/BetterCompaction
 pi update --extensions   # reconcile to the pinned ref later
 ```
 
