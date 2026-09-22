@@ -69,30 +69,16 @@ Restart pi (or start a new session). Done.
 
 ### Option B — as a pi package (local path)
 
-This repository is a [pi package](https://pi.dev/packages): `package.json`
-declares the `pi` manifest and the `pi-package` keyword, so pi can install
-the whole directory directly:
-
 ```bash
 pi install /absolute/path/to/better-compaction
 ```
 
-This writes the local path into your user settings (`~/.pi/agent/settings.json`).
-Use `pi install -l ...` to install into project settings (`.pi/settings.json`)
-instead. Remove with `pi remove /absolute/path/to/better-compaction`.
-
 ### Option C — as a pi package (git)
 
-Push this repository to a git host and install it by URL:
-
 ```bash
-pi install git:github.com/<you>/better-compaction@v1
+pi install git:github.com/NotSoSeriouss/BetterCompaction@v1
 pi update --extensions   # reconcile to the pinned ref later
 ```
-
-> **Note:** don't install the package *and* keep a copy of the file in
-> `~/.pi/agent/extensions/` at the same time — the extension would load twice.
-> Pick one.
 
 ## Usage
 
