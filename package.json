@@ -1,0 +1,23 @@
+{
+  "name": "better-compaction",
+  "version": "0.1.0",
+  "description": "Cache-friendly context compaction for pi — summarizes by appending to the real conversation prefix so KV/prefix caches are reused",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "compaction",
+    "context",
+    "cache"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
