@@ -39,8 +39,8 @@
  *                        // compaction runs instead. Settings are read at
  *                        // compaction time, so a change applies at the next
  *                        // compaction without restarting.
- *     "report": true,    // false → don't show the "Compaction completed in
- *                        // Xs ..." message after a compaction
+ *     "report": true,    // false → don't append the "Compaction completed
+ *                        // in Xs ..." message to the chat after a compaction
  *     "thinking": "low",  // "low" (default) | "off" | "inherit" (the session's
  *                         // level — the built-in behavior). Defaults to "low":
  *                         // summaries are short structured output, and a high
@@ -83,13 +83,17 @@
  *
  * When compaction runs without thinking, a warning is shown once per session
  * (some models summarize significantly worse — or not at all — without
- * thinking). After each successful compaction, a message reports total time,
- * the thinking vs generation split, and how many tokens were served from the
- * prefix cache. The report is emitted on pi's `session_compact` event, which
- * fires only after pi has applied the compaction result and finished the
- * compaction lifecycle — not inside `session_before_compact`, where it would
- * fire before the compaction is actually complete (making the message appear
- * inconsistently or disappear depending on the UI lifecycle).
+ * thinking). After each successful compaction, a persistent message is
+ * appended to the chat reporting total time, the thinking vs generation
+ * split, and how many tokens were served from the prefix cache. It is a
+ * custom session entry (pi.appendEntry) rendered by an entry renderer: it
+ * stays in the transcript — including across session reloads — but never
+ * participates in LLM context, so it costs no tokens and no cache. The entry
+ * is appended on pi's `session_compact` event, which fires only after pi has
+ * applied the compaction result and finished the compaction lifecycle — not
+ * inside `session_before_compact`, where it would be appended before the
+ * compaction is actually complete (making the message appear inconsistently
+ * or disappear depending on the UI lifecycle).
  *
  * Everything else works exactly like normal compaction: same summary format,
  * same firstKeptEntryId / tokensBefore bookkeeping, same cumulative file
@@ -114,6 +118,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { contentText, normalizeContext, retryAssistantCall } from "@earendil-works/pi-ai";
+import { Text } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
 // Prompts (verbatim from pi's built-in compaction, compaction.ts / utils.ts)
@@ -455,16 +460,27 @@ function applyBlockImages(messages: LlmMessage[]): LlmMessage[] {
 interface CompactionReport {
 	/** Wall-clock time of the final summarization attempt, ms. */
 	totalMs: number;
-	/** Sum of thinking_start→thinking_end spans of the final attempt, ms. */
+	/** First thinking token → start of the answer, ms (see produce() below). */
 	thinkingMs: number;
 	/** Tokens served from the prefix cache on the final attempt. */
 	cacheRead: number;
-	/** Which strategy produced the summary. */
-	strategy: "better-compaction";
+}
+
+/**
+ * Payload persisted with the "better-compaction-report" custom session entry.
+ * Custom entries are stored in the session file, rendered in the chat by the
+ * entry renderer, and excluded from LLM context — so the report is persistent
+ * (it survives session reloads) without costing tokens or cache.
+ */
+interface CompactionReportData {
+	totalMs: number;
+	thinkingMs: number;
+	cacheRead: number;
+	timestamp: number;
 }
 
 /** Build the report message (timing measured on the final attempt). */
-function formatCompactionReport(report: CompactionReport): string {
+function formatCompactionReport(report: CompactionReportData): string {
 	const details: string[] = [];
 	// The thinking breakdown is shown only when the model actually thought.
 	if (report.thinkingMs > 250) {
@@ -483,6 +499,15 @@ export default function (pi: ExtensionAPI) {
 	// Reports stashed by the session_before_compact handler, emitted on
 	// session_compact (see below). Cleared on session_compact_failed.
 	const pendingReports = new Map<string, CompactionReport>();
+
+	// Render the persisted post-compaction report in the chat. Custom entries
+	// never participate in LLM context, so the report stays visible in the
+	// transcript without being sent to the model.
+	pi.registerEntryRenderer<CompactionReportData>("better-compaction-report", (entry, _options, theme) => {
+		const data = entry.data;
+		if (!data || typeof data.totalMs !== "number") return undefined;
+		return new Text(theme.fg("dim", formatCompactionReport(data)), 0, 0);
+	});
 
 	// Warn once per session when compaction will run without thinking.
 	pi.on("session_start", (_event, ctx) => {
@@ -740,8 +765,13 @@ export default function (pi: ExtensionAPI) {
 		// Same agent-level retry policy pi's built-in compaction uses
 		// (settings.retry.*), so the compaction call honors retry.enabled too.
 		// The stream is consumed manually (same events .result() uses) so the
-		// final attempt can be timed: thinking time is the sum of
-		// thinking_start→thinking_end spans, the rest is generation.
+		// final attempt can be timed: thinking time is the span from
+		// thinking_start until the model moves on to a non-thinking block
+		// (text_start/toolcall_start) — OpenAI-compatible adapters emit
+		// thinking_end only after the stream has fully ended (blocks are
+		// finalized in bulk), so on those backends waiting for thinking_end
+		// would swallow the whole summary generation into "thinking" — the
+		// rest is generation.
 		let timing = { totalMs: 0, thinkingMs: 0 };
 		const produce = async () => {
 			const t0 = Date.now();
@@ -752,7 +782,13 @@ export default function (pi: ExtensionAPI) {
 			for await (const event of stream) {
 				if (event.type === "thinking_start" && spanStart === null) {
 					spanStart = Date.now();
-				} else if (event.type === "thinking_end") {
+				} else if (event.type === "thinking_end" ||
+					// Close the span as soon as the answer starts: on
+					// OpenAI-compatible adapters thinking_end only arrives at
+					// stream end, and text_start is the true end of thinking.
+					// (On adapters that emit thinking_end mid-stream, it has
+					// already closed the span, so text_start is a no-op.)
+					event.type === "text_start" || event.type === "toolcall_start") {
 					if (spanStart !== null) {
 						thinkingMs += Date.now() - spanStart;
 						spanStart = null;
@@ -816,13 +852,12 @@ export default function (pi: ExtensionAPI) {
 		//    step above it holds the final attempt's numbers, not a partial or
 		//    pre-validation value) for the session_compact event. It must NOT
 		//    be emitted here: session_before_compact runs before pi applies the
-		//    compaction result, so a notification fired in this handler would
+		//    compaction result, so a message appended in this handler would
 		//    claim "completed" before the compaction lifecycle is finished.
 		pendingReports.set(ctx.sessionManager.getSessionId(), {
 			totalMs: timing.totalMs,
 			thinkingMs: timing.thinkingMs,
 			cacheRead: response.usage.cacheRead,
-			strategy: "better-compaction",
 		});
 
 		return {
@@ -841,6 +876,10 @@ export default function (pi: ExtensionAPI) {
 	// actually emitted. A stashed report exists only when THIS extension
 	// supplied the compaction — for the built-in compaction (or when the
 	// handler returned early) there is nothing stashed, so no report is sent.
+	// The report is appended as a custom session entry: it shows in the chat
+	// (see the entry renderer above) and stays in the transcript, but is never
+	// sent to the LLM. No UI is required — in non-interactive modes the entry
+	// is still persisted and renders whenever the session is viewed.
 	pi.on("session_compact", (_event, ctx) => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const report = pendingReports.get(sessionId);
@@ -848,8 +887,13 @@ export default function (pi: ExtensionAPI) {
 		pendingReports.delete(sessionId); // emitted exactly once
 		// Read at emit time like every other option: report=false hides it.
 		const { settings } = loadPiSettings(ctx.cwd);
-		if (settings.betterCompaction?.report === false || !ctx.hasUI) return;
-		ctx.ui.notify(formatCompactionReport(report));
+		if (settings.betterCompaction?.report === false) return;
+		pi.appendEntry<CompactionReportData>("better-compaction-report", {
+			totalMs: report.totalMs,
+			thinkingMs: report.thinkingMs,
+			cacheRead: report.cacheRead,
+			timestamp: Date.now(),
+		});
 	});
 
 	// A failed or aborted compaction must not leave a stale report behind that

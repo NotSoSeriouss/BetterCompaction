@@ -1,7 +1,8 @@
 /**
  * better-compaction report lifecycle tests.
  *
- * Regression guard for the post-compaction report: it must be emitted on pi's
+ * Regression guard for the post-compaction report: it must be appended as a
+ * custom session entry (persistent in the chat, never sent to the LLM) on pi's
  * `session_compact` event (which fires only after pi has applied the
  * compaction result), NOT inside `session_before_compact` — and only for
  * compactions this extension actually produced.
@@ -22,14 +23,20 @@ import extension from "../extensions/better-compaction";
 interface ApiMock {
 	/** event → handler (in registration order) */
 	handlers: Map<string, unknown[]>;
+	/** entries appended via pi.appendEntry, in order */
+	entries: Array<{ customType: string; data?: unknown }>;
 	on: (event: string, handler: unknown) => () => void;
 	registerCommand: (name: string, def: unknown) => void;
+	registerEntryRenderer: (customType: string, renderer: unknown) => void;
+	appendEntry: (customType: string, data?: unknown) => void;
 }
 
 function createApiMock(): ApiMock {
 	const handlers = new Map<string, unknown[]>();
+	const entries: Array<{ customType: string; data?: unknown }> = [];
 	return {
 		handlers,
+		entries,
 		on: (event, handler) => {
 			const list = handlers.get(event) ?? [];
 			list.push(handler);
@@ -40,6 +47,10 @@ function createApiMock(): ApiMock {
 			};
 		},
 		registerCommand: () => {},
+		registerEntryRenderer: () => {},
+		appendEntry: (customType, data) => {
+			entries.push({ customType, data });
+		},
 	};
 }
 
@@ -137,6 +148,25 @@ function makeStream(message: unknown) {
 	};
 }
 
+/**
+ * Fake LLM stream in the order the OpenAI-compatible adapter actually emits:
+ * thinking_start … text_start (answer begins) … then thinking_end ONLY at
+ * stream end (blocks are finalized in bulk after the SSE loop).
+ */
+function makeOpenAiOrderStream(message: unknown) {
+	const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+	return {
+		async *[Symbol.asyncIterator]() {
+			yield { type: "thinking_start" };
+			await sleep(300);
+			yield { type: "text_start" };
+			await sleep(600);
+			yield { type: "thinking_end" }; // late: only at stream end
+			yield { type: "done", message };
+		},
+	};
+}
+
 function makeCtx(opts: {
 	sessionId: string;
 	cwd: string;
@@ -144,6 +174,8 @@ function makeCtx(opts: {
 	/** produce() results, consumed one per streamSimple call */
 	messages: unknown[];
 	hasUI?: boolean;
+	/** stream shape used by the fake streamSimple (default: makeStream) */
+	streamFactory?: (message: unknown) => unknown;
 }) {
 	const { entries, leafId } = makeEntries();
 	const calls: unknown[][] = [];
@@ -159,7 +191,7 @@ function makeCtx(opts: {
 			streamSimple: async (...args: unknown[]) => {
 				calls.push(args);
 				const msg = opts.messages.shift() ?? makeSummaryMessage();
-				return makeStream(msg);
+				return (opts.streamFactory ?? makeStream)(msg);
 			},
 		},
 		sessionManager: {
@@ -236,8 +268,7 @@ function freshExtension(): ApiMock {
 describe("post-compaction report lifecycle", () => {
 	test("is NOT emitted during session_before_compact, only on session_compact", async () => {
 		const api = freshExtension();
-		const messages: string[] = [];
-		const ctx = makeCtx({ sessionId: "s1", cwd: projectDir, notify: (m) => messages.push(m), messages: [] });
+		const ctx = makeCtx({ sessionId: "s1", cwd: projectDir, notify: () => {}, messages: [] });
 
 		// Summarization runs and the compaction result is returned…
 		const result = await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
@@ -248,18 +279,18 @@ describe("post-compaction report lifecycle", () => {
 		expect(compaction.tokensBefore).toBe(123_456);
 		expect(String(compaction.summary)).toContain("## Goal");
 		// …but nothing is reported yet: the compaction is not complete.
-		expect(messages).toEqual([]);
+		expect(api.entries).toEqual([]);
 
-		// …and the report appears exactly when pi says the compaction succeeded.
+		// …and the report entry appears exactly when pi says the compaction
+		// succeeded, with the final attempt's numbers.
 		await fire(api, "session_compact", compactEvent(), ctx);
-		expect(messages).toHaveLength(1);
-		expect(messages[0]).toMatch(
-			/^Compaction completed in \d+(\.\d)?s \(\d+\.\ds thinking, \d+\.\ds generating, 12\.3k tokens from cache\)\.$/,
-		);
+		expect(api.entries).toHaveLength(1);
+		expect(api.entries[0]!.customType).toBe("better-compaction-report");
+		expect(api.entries[0]!.data).toMatchObject({ cacheRead: 12_345 });
 
 		// …and never again for the same compaction.
 		await fire(api, "session_compact", compactEvent(), ctx);
-		expect(messages).toHaveLength(1);
+		expect(api.entries).toHaveLength(1);
 	});
 
 	test("reports the final attempt's timing after a retried summarization", async () => {
@@ -286,65 +317,60 @@ describe("post-compaction report lifecycle", () => {
 
 		const result = await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
 		expect((result as { compaction: { summary: string } }).compaction.summary).toContain("Final attempt");
-		expect(messages).toEqual([]);
+		expect(api.entries).toEqual([]);
 
 		await fire(api, "session_compact", compactEvent(), ctx);
-		expect(messages).toHaveLength(1);
-		// 55 < 1000 → no "k" formatting; must NOT be the 12.3k of attempt 1.
-		expect(messages[0]).toContain("55 tokens from cache");
-		expect(messages[0]).not.toContain("12.3k");
-		expect(messages[0].startsWith("Compaction completed in ")).toBe(true);
+		expect(api.entries).toHaveLength(1);
+		expect(api.entries[0]!.customType).toBe("better-compaction-report");
+		// Must be the final attempt's usage (55), not attempt 1's 12_345.
+		expect(api.entries[0]!.data).toMatchObject({ cacheRead: 55 });
 	});
 
 	test("does not report for pi's built-in compaction (no stashed report)", async () => {
 		const api = freshExtension();
-		const messages: string[] = [];
-		const ctx = makeCtx({ sessionId: "s3", cwd: projectDir, notify: (m) => messages.push(m), messages: [] });
+		const ctx = makeCtx({ sessionId: "s3", cwd: projectDir, notify: () => {}, messages: [] });
 
 		// session_compact without a preceding session_before_compact result
 		// (i.e. pi's built-in compaction ran) → no report.
 		await fire(api, "session_compact", compactEvent(), ctx);
-		expect(messages).toEqual([]);
+		expect(api.entries).toEqual([]);
 	});
 
 	test("discards the stashed report when the compaction fails", async () => {
 		const api = freshExtension();
-		const messages: string[] = [];
-		const ctx = makeCtx({ sessionId: "s4", cwd: projectDir, notify: (m) => messages.push(m), messages: [] });
+		const ctx = makeCtx({ sessionId: "s4", cwd: projectDir, notify: () => {}, messages: [] });
 
 		// Summarization succeeded (report stashed) but the compaction then fails.
 		const result = await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
 		expect(result).toBeDefined();
 		await fire(api, "session_compact_failed", compactFailedEvent(), ctx);
-		expect(messages).toEqual([]);
+		expect(api.entries).toEqual([]);
 
 		// A later successful compaction in the same session must not emit the
 		// stale report from the failed one (built-in path → nothing stashed).
 		await fire(api, "session_compact", compactEvent(), ctx);
-		expect(messages).toEqual([]);
+		expect(api.entries).toEqual([]);
 	});
 
 	test("respects report=false (set at emit time)", async () => {
 		const api = freshExtension();
-		const messages: string[] = [];
 		const cwd = join(tmp, "report-off");
 		mkdirSync(join(cwd, ".pi"), { recursive: true });
 		writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ betterCompaction: { report: false } }));
-		const ctx = makeCtx({ sessionId: "s5", cwd, notify: (m) => messages.push(m), messages: [] });
+		const ctx = makeCtx({ sessionId: "s5", cwd, notify: () => {}, messages: [] });
 
 		const result = await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
 		expect(result).toBeDefined(); // summary is still produced…
 		await fire(api, "session_compact", compactEvent(), ctx);
-		expect(messages).toEqual([]); // …but the report is suppressed
+		expect(api.entries).toEqual([]); // …but the report is suppressed
 	});
 
-	test("sends no report when there is no UI", async () => {
+	test("persists the report entry even when there is no UI", async () => {
 		const api = freshExtension();
-		const messages: string[] = [];
 		const ctx = makeCtx({
 			sessionId: "s6",
 			cwd: projectDir,
-			notify: (m) => messages.push(m),
+			notify: () => {},
 			messages: [],
 			hasUI: false,
 		});
@@ -352,26 +378,46 @@ describe("post-compaction report lifecycle", () => {
 		const result = await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
 		expect(result).toBeDefined();
 		await fire(api, "session_compact", compactEvent(), ctx);
-		expect(messages).toEqual([]);
+		// The report is a session entry, not a notification: no UI is needed,
+		// and it renders whenever the session is viewed interactively.
+		expect(api.entries).toHaveLength(1);
+		expect(api.entries[0]!.customType).toBe("better-compaction-report");
 	});
 
 	test("keeps reports isolated per session", async () => {
 		const api = freshExtension();
-		const s1: string[] = [];
-		const s2: string[] = [];
-		const ctxA = makeCtx({ sessionId: "sA", cwd: projectDir, notify: (m) => s1.push(m), messages: [] });
-		const ctxB = makeCtx({ sessionId: "sB", cwd: projectDir, notify: (m) => s2.push(m), messages: [] });
+		const ctxA = makeCtx({ sessionId: "sA", cwd: projectDir, notify: () => {}, messages: [] });
+		const ctxB = makeCtx({ sessionId: "sB", cwd: projectDir, notify: () => {}, messages: [] });
 
 		await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctxA);
 		await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctxB);
 
 		// Session A's completion must not consume or duplicate session B's report.
 		await fire(api, "session_compact", compactEvent(), ctxA);
-		expect(s1).toHaveLength(1);
-		expect(s2).toEqual([]);
+		expect(api.entries).toHaveLength(1);
 
 		await fire(api, "session_compact", compactEvent(), ctxB);
-		expect(s1).toHaveLength(1);
-		expect(s2).toHaveLength(1);
+		expect(api.entries).toHaveLength(2);
+	});
+
+	test("closes the thinking span at text_start (OpenAI adapters emit thinking_end only at stream end)", async () => {
+		const api = freshExtension();
+		const ctx = makeCtx({
+			sessionId: "s7",
+			cwd: projectDir,
+			notify: () => {},
+			messages: [],
+			streamFactory: makeOpenAiOrderStream,
+		});
+
+		await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
+		await fire(api, "session_compact", compactEvent(), ctx);
+		expect(api.entries).toHaveLength(1);
+		const data = api.entries[0]!.data as { totalMs: number; thinkingMs: number };
+		// The thinking span must end at text_start (~300ms), not at the late
+		// thinking_end (~900ms): the 600ms tail is the answer being generated.
+		// (With the old code thinkingMs ≈ 900 and "generating" ≈ 0.)
+		expect(data.thinkingMs).toBeLessThan(600);
+		expect(data.totalMs - data.thinkingMs).toBeGreaterThan(600);
 	});
 });

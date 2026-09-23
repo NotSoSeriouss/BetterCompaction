@@ -122,7 +122,7 @@ compaction time, so they apply at the **next compaction** without restarting.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | `false` → the extension stays silent and pi's built-in compaction runs instead |
-| `report` | `true` | `false` → don't send the "Compaction completed in Xs ..." message after a compaction (toggle with `/bc report off`) |
+| `report` | `true` | `false` → don't append the "Compaction completed in Xs ..." message to the chat after a compaction (toggle with `/bc report off`) |
 | `thinking` | `"low"` | Thinking level for the summarization call: `"low"` (short structured summaries rarely need more, and a high level can hit the model's thinking cap mid-summary), `"off"` (omits the reasoning parameter — identical to the agent's own requests when session thinking is off), `"inherit"` (follow the session's level — the built-in behavior) |
 | `lowThinkingBudget` | `2048` | Max thinking tokens sent when the summarization runs at thinking level `"low"` (also with `"inherit"` when the session level is low). Falls back to the global `thinkingBudgets.low`, then 2048. `0` disables the cap (toggle with `/bc lowbudget`) |
 | `thinkingBudgetField` | `"auto"` | The top-level OpenAI-compatible request field that carries the cap: `"thinking_budget_tokens"` (llama.cpp), `"thinking_token_budget"` (vLLM), `"thinking_budget"` (Qwen/DashScope/SGLang). `"auto"` uses the model's `compat.thinkingTokenBudgetField` when set, otherwise the llama.cpp field |
@@ -153,12 +153,14 @@ per-request field when the server was started without `--reasoning-budget`
   `Compaction completed in 42.3s (35.1s thinking, 7.2s generating, 94.4k tokens from cache).`
   The thinking breakdown is shown only when the model actually thought; the
   cache figure shows how many tokens the prefix cache served. The message is
-  emitted on pi's `session_compact` event — which fires only after pi has
-  applied the compaction result and finished the compaction lifecycle — with
-  the timing measured on the final summarization attempt. It is *not* sent for
-  pi's built-in compaction (the report is stashed per session during
-  `session_before_compact` and only exists when this extension supplied the
-  summary; a failed compaction discards the stashed report).
+  appended to the chat on pi's `session_compact` event — which fires only
+  after pi has applied the compaction result and finished the compaction
+  lifecycle — with the timing measured on the final summarization attempt. It
+  is stored as a custom session entry, so it stays in the transcript (and
+  survives session reloads) but is **never sent to the LLM**. It is *not*
+  appended for pi's built-in compaction (the report is stashed per session
+  during `session_before_compact` and only exists when this extension
+  supplied the summary; a failed compaction discards the stashed report).
 - **Once per session, when compaction will run without thinking:**
   `Better Compaction: thinking is disabled for compaction — some models
   summarize significantly worse (or not at all) without it`
