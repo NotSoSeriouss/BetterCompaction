@@ -85,7 +85,11 @@
  * (some models summarize significantly worse — or not at all — without
  * thinking). After each successful compaction, a message reports total time,
  * the thinking vs generation split, and how many tokens were served from the
- * prefix cache.
+ * prefix cache. The report is emitted on pi's `session_compact` event, which
+ * fires only after pi has applied the compaction result and finished the
+ * compaction lifecycle — not inside `session_before_compact`, where it would
+ * fire before the compaction is actually complete (making the message appear
+ * inconsistently or disappear depending on the UI lifecycle).
  *
  * Everything else works exactly like normal compaction: same summary format,
  * same firstKeptEntryId / tokensBefore bookkeeping, same cumulative file
@@ -442,7 +446,44 @@ function applyBlockImages(messages: LlmMessage[]): LlmMessage[] {
 // Extension
 // ---------------------------------------------------------------------------
 
+/**
+ * Timing/cache metadata for the post-compaction report. Stored during the
+ * summarization step (session_before_compact) and consumed by the
+ * session_compact event, which pi fires only after the compaction result has
+ * been applied. Keyed by session id so concurrent sessions don't interfere.
+ */
+interface CompactionReport {
+	/** Wall-clock time of the final summarization attempt, ms. */
+	totalMs: number;
+	/** Sum of thinking_start→thinking_end spans of the final attempt, ms. */
+	thinkingMs: number;
+	/** Tokens served from the prefix cache on the final attempt. */
+	cacheRead: number;
+	/** Which strategy produced the summary. */
+	strategy: "better-compaction";
+}
+
+/** Build the report message (timing measured on the final attempt). */
+function formatCompactionReport(report: CompactionReport): string {
+	const details: string[] = [];
+	// The thinking breakdown is shown only when the model actually thought.
+	if (report.thinkingMs > 250) {
+		const genMs = Math.max(0, report.totalMs - report.thinkingMs);
+		details.push(`${(report.thinkingMs / 1000).toFixed(1)}s thinking, ${(genMs / 1000).toFixed(1)}s generating`);
+	}
+	if (report.cacheRead > 0) {
+		const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
+		details.push(`${k(report.cacheRead)} tokens from cache`);
+	}
+	const suffix = details.length > 0 ? ` (${details.join(", ")})` : "";
+	return `Compaction completed in ${(report.totalMs / 1000).toFixed(1)}s${suffix}.`;
+}
+
 export default function (pi: ExtensionAPI) {
+	// Reports stashed by the session_before_compact handler, emitted on
+	// session_compact (see below). Cleared on session_compact_failed.
+	const pendingReports = new Map<string, CompactionReport>();
+
 	// Warn once per session when compaction will run without thinking.
 	pi.on("session_start", (_event, ctx) => {
 		const { settings } = loadPiSettings(ctx.cwd);
@@ -770,24 +811,19 @@ export default function (pi: ExtensionAPI) {
 		const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
 		const summary = summaryText + formatFileOperations(readFiles, modifiedFiles);
 
-		// 6. Report timing (measured on the final attempt). The thinking
-		//    breakdown is shown only when the model actually thought.
-		const details: string[] = [];
-		if (timing.thinkingMs > 250) {
-			const genMs = Math.max(0, timing.totalMs - timing.thinkingMs);
-			details.push(
-				`${(timing.thinkingMs / 1000).toFixed(1)}s thinking, ${(genMs / 1000).toFixed(1)}s generating`,
-			);
-		}
-		if (response.usage.cacheRead > 0) {
-			const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
-			details.push(`${k(response.usage.cacheRead)} tokens from cache`);
-		}
-		const suffix = details.length > 0 ? ` (${details.join(", ")})` : "";
-		// The post-compaction report can be switched off with report=false.
-		if (settings.betterCompaction?.report !== false && ctx.hasUI) {
-			ctx.ui.notify(`Compaction completed in ${(timing.totalMs / 1000).toFixed(1)}s${suffix}.`);
-		}
+		// 6. Stash the report (measured on the final attempt — `timing` is
+		//    rewritten by every produce() call, so after the validation/retry
+		//    step above it holds the final attempt's numbers, not a partial or
+		//    pre-validation value) for the session_compact event. It must NOT
+		//    be emitted here: session_before_compact runs before pi applies the
+		//    compaction result, so a notification fired in this handler would
+		//    claim "completed" before the compaction lifecycle is finished.
+		pendingReports.set(ctx.sessionManager.getSessionId(), {
+			totalMs: timing.totalMs,
+			thinkingMs: timing.thinkingMs,
+			cacheRead: response.usage.cacheRead,
+			strategy: "better-compaction",
+		});
 
 		return {
 			compaction: {
@@ -798,5 +834,28 @@ export default function (pi: ExtensionAPI) {
 				details: { readFiles, modifiedFiles, strategy: "better-compaction" },
 			},
 		};
+	});
+
+	// pi fires session_compact only after it has applied the compaction result
+	// and completed the compaction lifecycle, so this is where the report is
+	// actually emitted. A stashed report exists only when THIS extension
+	// supplied the compaction — for the built-in compaction (or when the
+	// handler returned early) there is nothing stashed, so no report is sent.
+	pi.on("session_compact", (_event, ctx) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		const report = pendingReports.get(sessionId);
+		if (!report) return; // built-in compaction — not ours to report
+		pendingReports.delete(sessionId); // emitted exactly once
+		// Read at emit time like every other option: report=false hides it.
+		const { settings } = loadPiSettings(ctx.cwd);
+		if (settings.betterCompaction?.report === false || !ctx.hasUI) return;
+		ctx.ui.notify(formatCompactionReport(report));
+	});
+
+	// A failed or aborted compaction must not leave a stale report behind that
+	// a later session_compact would emit for the wrong compaction. (A shutdown
+	// mid-compaction is safe too: the runtime — and this map — is torn down.)
+	pi.on("session_compact_failed", (_event, ctx) => {
+		pendingReports.delete(ctx.sessionManager.getSessionId());
 	});
 }

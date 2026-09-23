@@ -148,7 +148,13 @@ per-request field when the server was started without `--reasoning-budget`
 - **After each successful compaction** (disable with `/bc report off`):
   `Compaction completed in 42.3s (35.1s thinking, 7.2s generating, 94.4k tokens from cache).`
   The thinking breakdown is shown only when the model actually thought; the
-  cache figure shows how many tokens the prefix cache served.
+  cache figure shows how many tokens the prefix cache served. The message is
+  emitted on pi's `session_compact` event — which fires only after pi has
+  applied the compaction result and finished the compaction lifecycle — with
+  the timing measured on the final summarization attempt. It is *not* sent for
+  pi's built-in compaction (the report is stashed per session during
+  `session_before_compact` and only exists when this extension supplied the
+  summary; a failed compaction discards the stashed report).
 - **Once per session, when compaction will run without thinking:**
   `Better Compaction: thinking is disabled for compaction — some models
   summarize significantly worse (or not at all) without it`

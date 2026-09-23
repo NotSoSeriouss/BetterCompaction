@@ -11,6 +11,10 @@
     "cache"
   ],
   "license": "MIT",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json"
+  },
   "pi": {
     "extensions": [
       "./extensions"
@@ -19,5 +23,10 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "bun-types": "^1.4.2",
+    "typescript": "^7.0.2"
   }
 }
