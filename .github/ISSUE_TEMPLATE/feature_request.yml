@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest an improvement or new feature for Better Compaction
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: What's annoying, missing, or inefficient about the current behavior?
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: What would you like to happen?
+      description: Describe the feature or behavior you'd like.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Other ways you've thought about solving this, including workarounds.
+    validations:
+      required: false

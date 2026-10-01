@@ -1,0 +1,78 @@
+name: Bug report
+description: Report something broken — compaction failing, wrong output, errors, unexpected behavior
+labels: ["bug"]
+body:
+  - type: input
+    id: pi-version
+    attributes:
+      label: pi version
+      description: Run `pi --version` and paste the output here.
+      placeholder: e.g. 0.17.2
+    validations:
+      required: false
+  - type: input
+    id: extension-version
+    attributes:
+      label: Better Compaction version
+      description: The version or commit of this extension you're using.
+      placeholder: e.g. 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: model
+    attributes:
+      label: Model / backend
+      description: Which model and backend are you using?
+      options:
+        - Local (llama.cpp / ollama / other)
+        - OpenAI / OpenAI-compatible
+        - Anthropic
+        - Google
+        - Other / not sure
+    validations:
+      required: false
+  - type: dropdown
+    id: config
+    attributes:
+      label: How is it configured?
+      description: Are you using any custom settings or the `/bc` command?
+      options:
+        - Default (no custom settings)
+        - Custom settings (paste them in the description)
+        - Used `/bc` command during the session
+        - Both
+    validations:
+      required: false
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe what you actually saw. Include error messages verbatim.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: Describe what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: |
+        Steps to reproduce, or a description of the session:
+        - roughly how long was the conversation (token count if you know it)
+        - when compaction triggered (automatic or manual)
+        - any commands you ran
+    validations:
+      required: false
+  - type: upload
+    id: logs
+    attributes:
+      label: Logs
+      description: Attach relevant error output or pi log files, if any. Redact anything sensitive before uploading.
+    validations:
+      required: false
+      accept: ".log,.txt,.json,.csv"
