@@ -11,6 +11,9 @@
     "cache"
   ],
   "license": "MIT",
+  "files": [
+    "extensions/"
+  ],
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc -p tsconfig.json"
