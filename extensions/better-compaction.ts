@@ -110,11 +110,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-	buildContextEntries,
+	buildSessionProjection,
 	CONFIG_DIR_NAME,
 	convertToLlm,
 	getAgentDir,
-	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { contentText, normalizeContext, retryAssistantCall } from "@earendil-works/pi-ai";
@@ -629,11 +628,21 @@ export default function (pi: ExtensionAPI) {
 		// the conversation up to the cut is a prefix of that, so prefix/KV
 		// caches still cover it. The kept tail is deliberately omitted: the
 		// summarizer must not re-describe messages that stay in the session.
+		//
+		// The prefix is rebuilt from the EDIT-AWARE projection
+		// (buildSessionProjection), not the raw entries: the agent's actual LLM
+		// context applies context_edit entries (content replacements and
+		// omissions, e.g. from context-overflow recovery), and pi's own
+		// prepareCompaction works off this same projection. Rebuilding from the
+		// raw entries would make the request diverge from the cached agent
+		// prefix at the first edited message (silently losing the cache hit)
+		// and would feed the summarizer content the model never had. Each
+		// projected entry keeps its sourceEntry, so the cut point maps 1:1.
 		const entries = ctx.sessionManager.getEntries();
-		const contextEntries = buildContextEntries(entries, ctx.sessionManager.getLeafId());
-		const cutIndex = contextEntries.findIndex((e) => e.id === preparation.firstKeptEntryId);
+		const projection = buildSessionProjection(entries, ctx.sessionManager.getLeafId());
+		const cutIndex = projection.entries.findIndex((e) => e.sourceEntry.id === preparation.firstKeptEntryId);
 		if (cutIndex < 1) return; // nothing to summarize — let pi decide
-		const prefixMessages = contextEntries.slice(0, cutIndex).flatMap(sessionEntryToContextMessages);
+		const prefixMessages = projection.entries.slice(0, cutIndex).flatMap((e) => e.messages);
 		let llmMessages = convertToLlm(prefixMessages);
 
 		// pi's agent filters images out of every request when images.blockImages

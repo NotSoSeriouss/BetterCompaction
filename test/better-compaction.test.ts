@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildSessionProjection, convertToLlm, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import extension from "../extensions/better-compaction";
 
 // ---------------------------------------------------------------------------
@@ -99,6 +100,49 @@ function makeEntries(): { entries: unknown[]; leafId: string; keptEntryId: strin
 	return { entries, leafId: "entry-4", keptEntryId: "entry-2" };
 }
 
+/**
+ * A session whose model view diverges from the raw session file: one message
+ * was OMITTED from the model's context (e.g. context-overflow recovery) and
+ * one assistant message was REPLACED, both via context_edit entries before
+ * the cut point. Issue #3 regression fixture.
+ */
+function makeEditedEntries(): { entries: unknown[]; leafId: string; keptEntryId: string } {
+	const mk = (i: number, entry: Record<string, unknown>) => ({
+		...entry,
+		id: `entry-${i}`,
+		parentId: i === 0 ? null : `entry-${i - 1}`,
+		timestamp: new Date(1_700_000_000_000 + i * 1000).toISOString(),
+	});
+	const user = (text: string) => ({ role: "user" as const, content: text, timestamp: Date.now() });
+	const assistant = (text: string) => ({
+		role: "assistant" as const,
+		content: [{ type: "text" as const, text }],
+		api: "openai-completions" as const,
+		provider: "test",
+		model: "test-model",
+		usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
+		stopReason: "stop" as const,
+		timestamp: Date.now(),
+	});
+	return {
+		entries: [
+			mk(0, { type: "message", message: user("Read the codebase and tell me what it does.") }),
+			mk(1, { type: "message", message: assistant("It is a small CLI tool.") }),
+			mk(2, { type: "message", message: user("Original omitted question.") }),
+			mk(3, {
+				type: "message",
+				message: assistant("Original long answer the model no longer sees."),
+			}),
+			mk(4, { type: "context_edit", targetId: "entry-2", replacement: null }),
+			mk(5, { type: "context_edit", targetId: "entry-3", replacement: { content: "Shortened answer." } }),
+			mk(6, { type: "message", message: user("Now add a config file option.") }), // firstKeptEntryId
+			mk(7, { type: "message", message: assistant("Done, added --config.") }),
+		],
+		leafId: "entry-7",
+		keptEntryId: "entry-6",
+	};
+}
+
 function makePreparation(keptEntryId: string) {
 	return {
 		firstKeptEntryId: keptEntryId,
@@ -176,8 +220,12 @@ function makeCtx(opts: {
 	hasUI?: boolean;
 	/** stream shape used by the fake streamSimple (default: makeStream) */
 	streamFactory?: (message: unknown) => unknown;
+	entries?: unknown[];
+	leafId?: string;
 }) {
-	const { entries, leafId } = makeEntries();
+	const defaults = makeEntries();
+	const entries = opts.entries ?? defaults.entries;
+	const leafId = opts.leafId ?? defaults.leafId;
 	const calls: unknown[][] = [];
 	return {
 		calls,
@@ -419,5 +467,45 @@ describe("post-compaction report lifecycle", () => {
 		// (With the old code thinkingMs ≈ 900 and "generating" ≈ 0.)
 		expect(data.thinkingMs).toBeLessThan(600);
 		expect(data.totalMs - data.thinkingMs).toBeGreaterThan(600);
+	});
+});
+
+describe("edit-aware prefix rebuild (issue #3: context_edit projections)", () => {
+	// The agent's LLM context is the edit-aware projection (buildSessionProjection),
+	// which applies context_edit replacements/omissions — and that is the prefix
+	// the backend cached. The rebuilt summarization prefix must be
+	// byte-identical to it up to firstKeptEntryId, or prefix caching silently
+	// stops matching at the first edited message and the summarizer reads
+	// content the model never had.
+	test("rebuilt prefix equals the projected agent context when context_edits precede the cut", async () => {
+		const api = freshExtension();
+		const { entries, leafId, keptEntryId } = makeEditedEntries();
+		const ctx = makeCtx({ sessionId: "s8", cwd: projectDir, notify: () => {}, messages: [], entries, leafId });
+
+		const result = await fire(api, "session_before_compact", beforeCompactEvent(keptEntryId), ctx);
+		expect(result).toBeDefined();
+
+		// The summarization request: modelRegistry.streamSimple(model, requestContext, options)
+		const requestContext = ctx.calls[0]![1] as { messages: unknown[] };
+		const sent = requestContext.messages.slice(0, -1); // minus the appended compaction prompt
+
+		// Strong assertion: the sent prefix IS the projected agent context up
+		// to the cut point (same conversion the projection itself uses).
+		const projection = buildSessionProjection(entries as SessionEntry[], leafId);
+		const cutIndex = projection.entries.findIndex((e) => e.sourceEntry.id === keptEntryId);
+		expect(cutIndex).toBeGreaterThanOrEqual(0);
+		const expectedPrefix = convertToLlm(projection.entries.slice(0, cutIndex).flatMap((e) => e.messages));
+		expect(sent).toEqual(expectedPrefix);
+
+		// Explicit, readable checks for the two edit kinds:
+		const sentText = JSON.stringify(sent);
+		// Omission: the omitted user message must not be sent at all…
+		expect(sentText).not.toContain("Original omitted question.");
+		// …it (and the two context_edit bookkeeping entries) contribute no
+		// messages: only entry-0, entry-1 and the replaced entry-3 remain.
+		expect(sent.length).toBe(3);
+		// Replacement: the model sees the replacement, not the original content.
+		expect(sentText).toContain("Shortened answer.");
+		expect(sentText).not.toContain("Original long answer the model no longer sees.");
 	});
 });
