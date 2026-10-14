@@ -53,7 +53,8 @@ supports prefix/KV caching.
 There are no formal benchmarks — compaction time depends heavily on your
 hardware and your model. On my machine, with Qwen3.8-27B, the same session
 went from **about 13–15 minutes** of compaction down to **about 6.5 minutes**,
-and to **about 2 minutes** with thinking disabled (`/bc thinking off`).
+and to **about 2 minutes** with compaction steered to skip thinking
+(`/bc thinking off`).
 
 ## Install
 
@@ -93,8 +94,7 @@ pi update --extensions   # reconcile to the pinned ref later
 | `/bc` | Show effective options: enabled or not, compaction thinking level, session thinking level, and which settings file provides the config |
 | `/bc on` | Enable the extension (default) |
 | `/bc off` | Disable the extension — pi's built-in compaction takes over |
-| `/bc thinking low\|off\|inherit` | Set the summarization thinking level |
-| `/bc lowbudget <tokens>` | Set the max thinking tokens sent when compaction runs at "low" (0 = no cap) |
+| `/bc thinking off\|inherit` | Set the summarization thinking level |
 | `/bc report on\|off` | Show / hide the post-compaction report message (timing and cache read) |
 
 `/bc` writes to the settings file that **currently provides** the
@@ -112,9 +112,7 @@ compaction time, so they apply at the **next compaction** without restarting.
   "betterCompaction": {
     "enabled": true,
     "report": true,
-    "thinking": "low",
-    "lowThinkingBudget": 2048,
-    "thinkingBudgetField": "auto"
+    "thinking": "inherit"
   }
 }
 ```
@@ -123,29 +121,36 @@ compaction time, so they apply at the **next compaction** without restarting.
 | --- | --- | --- |
 | `enabled` | `true` | `false` → the extension stays silent and pi's built-in compaction runs instead |
 | `report` | `true` | `false` → don't append the "Compaction completed in Xs ..." message to the chat after a compaction (toggle with `/bc report off`) |
-| `thinking` | `"low"` | Thinking level for the summarization call: `"low"` (short structured summaries rarely need more, and a high level can hit the model's thinking cap mid-summary), `"off"` (omits the reasoning parameter — identical to the agent's own requests when session thinking is off), `"inherit"` (follow the session's level — the built-in behavior) |
-| `lowThinkingBudget` | `2048` | Max thinking tokens sent when the summarization runs at thinking level `"low"` (also with `"inherit"` when the session level is low). Falls back to the global `thinkingBudgets.low`, then 2048. `0` disables the cap (toggle with `/bc lowbudget`) |
-| `thinkingBudgetField` | `"auto"` | The top-level OpenAI-compatible request field that carries the cap: `"thinking_budget_tokens"` (llama.cpp), `"thinking_token_budget"` (vLLM), `"thinking_budget"` (Qwen/DashScope/SGLang). `"auto"` uses the model's `compat.thinkingTokenBudgetField` when set, otherwise the llama.cpp field |
+| `thinking` | `"inherit"` | Thinking level for the summarization call: `"inherit"` (the model keeps thinking, but the prompt asks it to keep thinking brief), `"off"` (the prompt asks it to skip thinking entirely and go straight to the summary). In both cases the request itself always runs at the session's own thinking level — see below |
 
-### How the "low" thinking cap works
+### How thinking is handled (and why the thinking mode is never changed)
 
 Summaries are short structured output, but a reasoning model with thinking
 enabled will still burn a long thinking phase on them — on local backends the
-thinking phase dominates compaction time and can hit the model's thinking cap
-mid-summary. So when the summarization call runs at thinking level `"low"`
-(the default), the extension also sends a max-thinking-tokens cap as a
-top-level field of the OpenAI-compatible request body, e.g.
-`"thinking_budget_tokens": 2048` for a local llama.cpp server. The cap is
-injected through pi-ai's `samplingParams` pass-through, which merges the field
-into the request body last (so it wins over any model-level value) and only
-OpenAI-compatible adapters apply — calls on other APIs (Anthropic, ...) are
-unchanged.
+thinking phase dominates compaction time. The old design answered this with a
+`"low"` thinking level plus a max-thinking-tokens cap. That design is gone, for
+a cache reason:
 
-The value is `lowThinkingBudget` (default 2048, falling back to the global
-`thinkingBudgets.low`), clamped so at least 1024 tokens remain for the summary
-itself under the response ceiling. Note that llama.cpp only honors the
-per-request field when the server was started without `--reasoning-budget`
-(a server-level budget always wins).
+With some models the thinking mode is applied at the **chat-template level**.
+The template injects different prompts into the running chat depending on the
+mode, so switching the thinking mode (or disabling thinking) mid-session
+changes the prompt structure — and that forces the backend to **re-prefill the
+whole conversation**, exactly the cost this extension exists to avoid.
+
+So the summarization request always runs at the **session's own thinking
+level**, identical to the agent's last request, and the prompt cache is reused
+instead of being thrown away. To make the model think less, the extension
+steers it in the appended compaction prompt instead:
+
+- `"inherit"` (default) appends a short instruction telling the model to keep
+  its thinking brief (this is what the `"low"` cap used to achieve).
+- `"off"` appends a stronger instruction telling the model that thinking is
+  disabled for this task and to stop thinking immediately and go straight to
+  writing the summary. The request still technically carries the session's
+  thinking level (to keep the cache), but the model is told not to use it.
+
+This is why there is no longer any way to change the request's thinking mode:
+every path keeps it identical to the session's.
 
 ### Notifications
 
@@ -161,15 +166,15 @@ per-request field when the server was started without `--reasoning-budget`
   appended for pi's built-in compaction (the report is stashed per session
   during `session_before_compact` and only exists when this extension
   supplied the summary; a failed compaction discards the stashed report).
-- **Once per session, when compaction will run without thinking:**
-  `Better Compaction: thinking is disabled for compaction — some models
+- **Once per session, when compaction will run with thinking turned off:**
+  `Better Compaction: compaction will run with thinking turned off — some models
   summarize significantly worse (or not at all) without it`
 
 The extension also mirrors the settings pi applies to normal agent requests
 (`images.blockImages`, `retry.*`, provider timeouts, transport, thinking
 budgets), reading the same settings files pi merges, so the summarization
-request stays identical to what the agent sends — plus the "low" thinking
-cap described above, which the agent's own requests don't carry.
+request stays identical to what the agent sends — including its thinking mode,
+which is the key to reusing the prompt cache (see above).
 
 ## Repository layout
 
