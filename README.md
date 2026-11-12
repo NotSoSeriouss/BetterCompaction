@@ -152,6 +152,30 @@ steers it in the appended compaction prompt instead:
 This is why there is no longer any way to change the request's thinking mode:
 every path keeps it identical to the session's.
 
+### Retries and failure diagnostics
+
+Summarization failures are mostly stochastic model behavior, not request
+problems: a model may call a tool instead of summarizing, run the token cap
+out in its thinking phase, or — on small quantized models at deep context —
+stop without writing any text at all. Because a failed response appends
+nothing to the conversation, every retry still hits the prompt cache and costs
+only generation time — far less than the full re-prefill the built-in
+compaction would need. So the extension makes up to **three attempts**: the
+first is the request described above, and attempts 2 and 3 escalate the
+appended instruction to "skip thinking entirely" (thinking is the expensive,
+failure-prone part) while the cached conversation prefix stays identical.
+
+If every attempt fails, the model's complete output for each attempt (stop
+reason, usage, and every thinking/text/tool-call block) is saved to
+
+```
+~/.pi/agent/logs/better-compaction-failed-<session>-<timestamp>.txt
+```
+
+and the error pi reports carries the file path, so the output can be inspected
+or attached to a bug report. pi then falls back to its built-in compaction as
+usual. A user-initiated abort is never retried and saves no diagnostics.
+
 ### Notifications
 
 - **After each successful compaction** (disable with `/bc report off`):
@@ -182,9 +206,14 @@ which is the key to reusing the prompt cache (see above).
 better-compaction/
 ├── package.json               # pi package manifest (pi.extensions, pi-package keyword)
 ├── README.md
+├── LICENSE
+├── tsconfig.json              # type-checking config (noEmit — there is no build step)
 ├── .gitignore
-└── extensions/
-    └── better-compaction.ts   # the extension (single file, no build step)
+├── .github/                   # issue templates (bug report, feature request, question)
+├── extensions/
+│   └── better-compaction.ts   # the extension (single file, no build step)
+└── test/
+    └── better-compaction.test.ts
 ```
 
 - `package.json` declares `"pi": { "extensions": ["./extensions"] }` and the
@@ -198,12 +227,16 @@ better-compaction/
 
 ## Development notes
 
-- Type-checking locally: pi resolves the peer packages with its own loader
-  aliases at runtime. To type-check outside pi, point a `tsconfig.json`
-  `paths` entry for `@earendil-works/pi-coding-agent` and
-  `@earendil-works/pi-ai` at the installed pi package
-  (`<pi-install>/dist/index.d.ts` and
-  `<pi-install>/node_modules/@earendil-works/pi-ai/dist/index.d.ts`).
+- Tests: `bun test` runs `test/better-compaction.test.ts` — a self-contained
+  suite with fake LLM streams and a hermetic pi agent directory (no network,
+  no real model).
+- Type-checking locally: `npm install && npm run typecheck` (or
+  `tsc -p tsconfig.json`). `npm install` pulls the peer packages
+  (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`) that provide
+  the types; there is no build step and no emit.
+  The suite and the type check pass against pi 1.5.2 (latest as of this
+  release); the extension requires pi 0.87.1 or higher (the edit-aware
+  session projection it rebuilds from landed in the 0.87 series).
 - Known limitations (documented, intentional):
   - If other extensions or pi features transform the LLM context
     (`transformContext` handlers, forced prompts), the rebuilt prefix may no

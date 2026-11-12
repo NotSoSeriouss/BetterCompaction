@@ -11,7 +11,7 @@
  */
 /// <reference types="bun-types" />
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildSessionProjection, convertToLlm, type SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -157,7 +157,7 @@ function makePreparation(keptEntryId: string) {
 
 function makeSummaryMessage(overrides?: {
 	cacheRead?: number;
-	stopReason?: "stop" | "error";
+	stopReason?: "stop" | "error" | "length" | "aborted";
 	errorMessage?: string;
 	text?: string;
 }) {
@@ -175,6 +175,38 @@ function makeSummaryMessage(overrides?: {
 		},
 		stopReason: overrides?.stopReason ?? ("stop" as const),
 		...(overrides?.errorMessage ? { errorMessage: overrides.errorMessage } : {}),
+		timestamp: Date.now(),
+	};
+}
+
+/**
+ * A response with NO text: the model ended its turn right after (or inside)
+ * its thinking phase — the issue #6 failure on a small quantized reasoning
+ * model at deep context (clean stop, thinking block only).
+ */
+function makeThinkingOnlyMessage() {
+	return {
+		role: "assistant" as const,
+		content: [{ type: "thinking" as const, thinking: "Let me think about what to summarize…" }],
+		api: "openai-completions" as const,
+		provider: "test",
+		model: "test-model",
+		usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0 },
+		stopReason: "stop" as const,
+		timestamp: Date.now(),
+	};
+}
+
+/** A response that calls a tool instead of summarizing (no text). */
+function makeToolCallOnlyMessage() {
+	return {
+		role: "assistant" as const,
+		content: [{ type: "toolCall" as const, id: "tc-1", name: "bash", arguments: { command: "ls" } }],
+		api: "openai-completions" as const,
+		provider: "test",
+		model: "test-model",
+		usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0 },
+		stopReason: "stop" as const,
 		timestamp: Date.now(),
 	};
 }
@@ -467,6 +499,174 @@ describe("post-compaction report lifecycle", () => {
 		// (With the old code thinkingMs ≈ 900 and "generating" ≈ 0.)
 		expect(data.thinkingMs).toBeLessThan(600);
 		expect(data.totalMs - data.thinkingMs).toBeGreaterThan(600);
+	});
+});
+
+describe("unusable summarization responses (issue #6: no-text responses)", () => {
+	/** The appended compaction instruction of the n-th (0-based) LLM call. */
+	function appendedInstruction(ctx: ReturnType<typeof makeCtx>, callIndex: number): string {
+		const rc = ctx.calls[callIndex]![1] as { messages: unknown[] };
+		const last = rc.messages[rc.messages.length - 1] as { content: Array<{ type: string; text?: string }> };
+		return last.content[0].text ?? "";
+	}
+
+	/** Extract the diagnostics file path from a final-failure message. */
+	function pathFromFailure(message: string): string {
+		const m = message.match(/model output saved to (.+) \(pi falls back to built-in compaction\)/);
+		expect(m, "failure message must carry the diagnostics path").toBeDefined();
+		return m![1]!;
+	}
+
+	test("retries a clean stop with no text (thinking only) and succeeds on the second attempt", async () => {
+		// Issue #6: the model ended its turn right after (or inside) its
+		// thinking phase and wrote no text at all — a clean stop, not a
+		// provider error, so the stream-level retry policy never sees it.
+		const api = freshExtension();
+		const ctx = makeCtx({
+			sessionId: "s10",
+			cwd: projectDir,
+			notify: () => {},
+			messages: [makeThinkingOnlyMessage(), makeSummaryMessage({ cacheRead: 777 })],
+		});
+
+		const result = await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
+		expect(result).toBeDefined();
+		expect((result as { compaction: { summary: string } }).compaction.summary).toContain("## Goal");
+		// The empty first attempt must have triggered exactly one retry…
+		expect(ctx.calls).toHaveLength(2);
+		// …and the report must carry the FINAL attempt's usage.
+		await fire(api, "session_compact", compactEvent(), ctx);
+		expect(api.entries).toHaveLength(1);
+		expect(api.entries[0]!.data).toMatchObject({ cacheRead: 777 });
+		// The retry keeps the cached conversation prefix and escalates the
+		// thinking steering: attempt 1 asks for brief thinking, attempt 2 asks
+		// to skip thinking entirely.
+		expect(appendedInstruction(ctx, 0)).toContain("Keep your internal thinking short");
+		expect(appendedInstruction(ctx, 0)).not.toContain("Thinking is disabled for this task");
+		expect(appendedInstruction(ctx, 1)).toContain("Thinking is disabled for this task");
+	});
+
+	test("retries a lone tool call (no text) and succeeds on the second attempt", async () => {
+		const api = freshExtension();
+		const ctx = makeCtx({
+			sessionId: "s11",
+			cwd: projectDir,
+			notify: () => {},
+			messages: [makeToolCallOnlyMessage(), makeSummaryMessage({ text: "## Goal\nRecovered." })],
+		});
+
+		const result = await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
+		expect((result as { compaction: { summary: string } }).compaction.summary).toContain("Recovered.");
+		expect(ctx.calls).toHaveLength(2);
+	});
+
+	test("retries a token-cap stop (thinking ate the budget) and succeeds on the second attempt", async () => {
+		const api = freshExtension();
+		const ctx = makeCtx({
+			sessionId: "s13",
+			cwd: projectDir,
+			notify: () => {},
+			messages: [
+				makeSummaryMessage({ stopReason: "length", text: "## Goal\nPartial — cut off mid-summary." }),
+				makeSummaryMessage({ text: "## Goal\nFull summary after the no-thinking retry." }),
+			],
+		});
+
+		const result = await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
+		expect((result as { compaction: { summary: string } }).compaction.summary).toContain("Full summary");
+		expect(ctx.calls).toHaveLength(2);
+		// The retry steers the model to skip thinking — the fix for "thinking
+		// ate the budget": thinking is what consumed the whole maxTokens.
+		expect(appendedInstruction(ctx, 0)).toContain("Keep your internal thinking short");
+		expect(appendedInstruction(ctx, 1)).toContain("Thinking is disabled for this task");
+	});
+
+	test("gives up after three attempts and saves the model output to a file", async () => {
+		const api = freshExtension();
+		const ctx = makeCtx({
+			sessionId: "s12",
+			cwd: projectDir,
+			notify: () => {},
+			messages: [makeThinkingOnlyMessage(), makeThinkingOnlyMessage(), makeThinkingOnlyMessage()],
+		});
+
+		let thrown: unknown;
+		try {
+			await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
+		} catch (err) {
+			thrown = err;
+		}
+		expect(thrown).toBeDefined();
+		const message = String((thrown as Error).message);
+		expect(message).toContain("Summarization failed after 3 attempts");
+		expect(message).toContain("returned no text");
+		expect(ctx.calls).toHaveLength(3);
+		// The diagnostics file exists and contains the model's complete output
+		// for every attempt (thinking included — that is the point: the user
+		// can see what the model was actually thinking).
+		const path = pathFromFailure(message);
+		expect(existsSync(path)).toBe(true);
+		const log = readFileSync(path, "utf8");
+		expect(log).toContain("[thinking]");
+		expect(log).toContain("stop reason: stop");
+		expect(log).toContain("--- attempt 3 ---");
+		// Nothing was stashed, so a later session_compact emits no report.
+		await fire(api, "session_compact", compactEvent(), ctx);
+		expect(api.entries).toEqual([]);
+	});
+
+	test("does not retry an aborted summarization and saves no diagnostics", async () => {
+		const api = freshExtension();
+		const ctx = makeCtx({
+			sessionId: "s14",
+			cwd: projectDir,
+			notify: () => {},
+			messages: [makeSummaryMessage({ stopReason: "aborted" })],
+		});
+
+		await expect(fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx)).rejects.toThrow(
+			"Compaction aborted",
+		);
+		expect(ctx.calls).toHaveLength(1);
+		const dir = join(process.env.PI_CODING_AGENT_DIR!, "logs");
+		const failedLogs = existsSync(dir)
+			? readdirSync(dir).filter((f) => f.startsWith("better-compaction-failed-s14-"))
+			: [];
+		expect(failedLogs).toEqual([]);
+	});
+
+	test("saves diagnostics for a provider error (after the retry policy is spent)", async () => {
+		const api = freshExtension();
+		const cwd = join(tmp, "error-project");
+		mkdirSync(join(cwd, ".pi"), { recursive: true });
+		// Fast, shallow retry so the test stays quick: the wrapper spends its
+		// policy (1 retry) and the extension must not spend it again.
+		writeFileSync(
+			join(cwd, ".pi", "settings.json"),
+			JSON.stringify({ retry: { enabled: true, maxRetries: 1, baseDelayMs: 10, maxAgentDelayMs: 100 } }),
+		);
+		const ctx = makeCtx({
+			sessionId: "s15",
+			cwd,
+			notify: () => {},
+			messages: [
+				makeSummaryMessage({ stopReason: "error", errorMessage: "overloaded, please retry" }),
+				makeSummaryMessage({ stopReason: "error", errorMessage: "overloaded, please retry" }),
+			],
+		});
+
+		let thrown: unknown;
+		try {
+			await fire(api, "session_before_compact", beforeCompactEvent("entry-2"), ctx);
+		} catch (err) {
+			thrown = err;
+		}
+		const message = String((thrown as Error).message);
+		expect(message).toContain("Summarization failed after 1 attempt: overloaded");
+		expect(ctx.calls).toHaveLength(2); // wrapper's initial call + its one retry
+		const path = pathFromFailure(message);
+		expect(existsSync(path)).toBe(true);
+		expect(readFileSync(path, "utf8")).toContain("error:       overloaded, please retry");
 	});
 });
 

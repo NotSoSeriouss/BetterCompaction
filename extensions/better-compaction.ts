@@ -91,9 +91,12 @@
  * Note: the summarization model now sees the conversation as a live dialogue
  * full of real tool calls, so the appended prompt explicitly forbids
  * continuing the conversation and calling tools. Models that attempt a tool
- * call anyway are handled gracefully (see the validation step).
+ * call anyway — or that fail in other ways (token cap exhausted in thinking,
+ * stopping without writing any text) — are retried up to three times (every
+ * retry reuses the prompt cache); if every attempt fails, the model's complete
+ * output is saved to a log file for analysis and the error carries its path.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -431,6 +434,52 @@ interface CompactionReportData {
 	timestamp: number;
 }
 
+/**
+ * Save the complete model output of every failed summarization attempt to a
+ * file so the user can inspect what the model actually did (and attach the
+ * file to a bug report if they want to). Returns the file path.
+ */
+function writeSummarizationFailureLog(
+	sessionId: string,
+	model: { provider: string; id: string },
+	thinkingChoice: "off" | "inherit",
+	sessionThinkingLevel: string | undefined,
+	attempts: Array<{ attempt: number; response: AssistantMessage; problem?: string }>,
+): string {
+	const dir = join(getAgentDir(), "logs");
+	mkdirSync(dir, { recursive: true });
+	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+	const path = join(dir, `better-compaction-failed-${sessionId}-${stamp}.txt`);
+	const lines: string[] = [
+		"Better Compaction: summarization failed — model output for analysis",
+		`session:  ${sessionId}`,
+		`model:    ${model.provider}/${model.id}`,
+		`time:     ${new Date().toISOString()}`,
+		`thinking: ${thinkingChoice} (session level: ${sessionThinkingLevel ?? "off"})`,
+		"",
+	];
+	for (const { attempt, response, problem } of attempts) {
+		lines.push(`--- attempt ${attempt} ---`);
+		lines.push(`stop reason: ${response.stopReason}`);
+		if (response.errorMessage) lines.push(`error:       ${response.errorMessage}`);
+		if (problem) lines.push(`problem:     ${problem}`);
+		const u = response.usage;
+		lines.push(`usage:       input=${u.input} output=${u.output} cacheRead=${u.cacheRead} cacheWrite=${u.cacheWrite}`);
+		for (const block of response.content) {
+			if (block.type === "thinking") {
+				lines.push("[thinking]", block.thinking, "");
+			} else if (block.type === "text") {
+				lines.push("[text]", block.text, "");
+			} else if (block.type === "toolCall") {
+				lines.push(`[toolCall] ${block.name} ${JSON.stringify(block.arguments)}`, "");
+			}
+		}
+		lines.push("");
+	}
+	writeFileSync(path, lines.join("\n"));
+	return path;
+}
+
 /** Build the report message (timing measured on the final attempt). */
 function formatCompactionReport(report: CompactionReportData): string {
 	const details: string[] = [];
@@ -609,31 +658,44 @@ export default function (pi: ExtensionAPI) {
 
 		// 2. The compaction prompt: pi's summarization system prompt, now
 		//    appended at the end of the conversation as a single user message.
-		let promptText = SUMMARY_ROLE + "\n\n";
-		if (preparation.previousSummary) {
-			promptText += `<previous-summary>\n${preparation.previousSummary}\n</previous-summary>\n\n`;
-		}
-		promptText += preparation.previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
-		// Steer thinking in the appended prompt rather than in the request
-		// (changing the request's thinking mode would force a full prefill):
-		// the summary is short structured output, so we don't want a long
-		// thinking phase on it. "off" asks the model to skip thinking entirely;
-		// "inherit" (default) asks it to keep thinking brief.
-		promptText += thinkingChoice === "off" ? NO_THINKING_INSTRUCTION : BRIEF_THINKING_INSTRUCTION;
-		if (customInstructions) {
-			promptText += `\n\nAdditional focus: ${customInstructions}`;
-		}
+		//
+		// Built per attempt: from attempt 2 on the thinking steering escalates
+		// (see the attempt loop below). Only this appended message ever differs
+		// between attempts — the conversation prefix, which is the part the
+		// backend cached, is identical every time, so a retry still hits the
+		// prompt cache and costs only generation time.
+		const buildPromptText = (escalateThinking: boolean) => {
+			let promptText = SUMMARY_ROLE + "\n\n";
+			if (preparation.previousSummary) {
+				promptText += `<previous-summary>\n${preparation.previousSummary}\n</previous-summary>\n\n`;
+			}
+			promptText += preparation.previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+			// Steer thinking in the appended prompt rather than in the request
+			// (changing the request's thinking mode would force a full prefill):
+			// the summary is short structured output, so we don't want a long
+			// thinking phase on it. "off" asks the model to skip thinking
+			// entirely; "inherit" (default) asks it to keep thinking brief.
+			// Retries escalate to the stronger "skip thinking" steering either
+			// way: thinking is the expensive, failure-prone part of the call.
+			const skipThinking = thinkingChoice === "off" || escalateThinking;
+			promptText += skipThinking ? NO_THINKING_INSTRUCTION : BRIEF_THINKING_INSTRUCTION;
+			if (customInstructions) {
+				promptText += `\n\nAdditional focus: ${customInstructions}`;
+			}
+			return promptText;
+		};
 
-		const requestContext = normalizeContext({
-			messages: [
-				...llmMessages,
-				{
-					role: "user",
-					content: [{ type: "text", text: promptText }],
-					timestamp: Date.now(),
-				},
-			],
-		});
+		const buildRequestContext = (escalateThinking: boolean) =>
+			normalizeContext({
+				messages: [
+					...llmMessages,
+					{
+						role: "user",
+						content: [{ type: "text", text: buildPromptText(escalateThinking) }],
+						timestamp: Date.now(),
+					},
+				],
+			});
 
 		// 3. One LLM call through the configured provider. Same token budget
 		//    and thinking level as the built-in compaction, and the same
@@ -706,12 +768,12 @@ export default function (pi: ExtensionAPI) {
 		// would swallow the whole summary generation into "thinking" — the
 		// rest is generation.
 		let timing = { totalMs: 0, thinkingMs: 0 };
-		const produce = async () => {
+		const produce = async (requestCtx: ReturnType<typeof normalizeContext>) => {
 			const t0 = Date.now();
 			let thinkingMs = 0;
 			let spanStart: number | null = null;
 			let message: AssistantMessage | undefined;
-			const stream = await ctx.modelRegistry.streamSimple(model, requestContext, streamOptions);
+			const stream = await ctx.modelRegistry.streamSimple(model, requestCtx, streamOptions);
 			for await (const event of stream) {
 				if (event.type === "thinking_start" && spanStart === null) {
 					spanStart = Date.now();
@@ -743,45 +805,95 @@ export default function (pi: ExtensionAPI) {
 			baseDelayMs: settings.retry?.baseDelayMs ?? 2000,
 			maxAgentDelayMs: settings.retry?.maxAgentDelayMs ?? 60_000,
 		};
-		let response = await retryAssistantCall(produce, retryPolicy, signal);
 
-		// 4. Validate like the built-in compaction does: never persist a
-		//    partial or failed summary.
+		// 4. Summarize, with retries.
 		//
 		// The summarized conversation is full of real tool calls, so some
 		// models — especially smaller local ones — attempt to call a tool
-		// instead of just summarizing, despite the prompt forbidding it.
-		// Recover: keep the summary text when there is one, otherwise retry
-		// the identical request once before giving up.
+		// instead of just summarizing, despite the prompt forbidding it. And
+		// a reasoning model can fail in worse ways: run the token cap out in
+		// its thinking phase, or end its turn right inside/after thinking
+		// without writing any text at all (issue #6, seen on small quantized
+		// models at deep context). These failures are stochastic even though
+		// the request is well-formed, and — crucially — they do not touch the
+		// cached prefix: a failed response appends nothing to the conversation,
+		// so every retry still hits the prompt cache and costs only generation
+		// time, far less than the full re-prefill the built-in compaction would
+		// need. Attempts 2+ escalate the thinking steering to "skip thinking"
+		// (see buildPromptText). If every attempt fails, the model's complete
+		// output for each attempt is saved to a file and the error carries the
+		// path; pi then reports the failure and falls back to its built-in
+		// compaction as usual. A response with text is kept even if it also
+		// carries a stray tool call.
+		const MAX_SUMMARIZATION_ATTEMPTS = 3;
 		const hasToolCall = (r: AssistantMessage) => r.content.some((b) => b.type === "toolCall");
-		const validateResponse = (r: AssistantMessage) => {
-			if (r.stopReason === "aborted") throw new Error("Compaction aborted");
-			if (r.stopReason === "error") {
-				throw new Error(`Summarization failed: ${r.errorMessage || "Unknown error"}`);
-			}
+		const summaryTextOf = (r: AssistantMessage) => contentText(r.content).trim();
+		/** Why a completed (non-aborted, non-error) response is unusable; null = usable. */
+		const contentProblem = (r: AssistantMessage): string | null => {
 			if (r.stopReason === "length" && !hasToolCall(r)) {
-				throw new Error("Summarization failed: generation hit the token cap and the summary is incomplete");
+				return "generation hit the token cap and the summary is incomplete";
 			}
+			if (!summaryTextOf(r)) {
+				return hasToolCall(r)
+					? "the model attempted to call a tool instead of summarizing"
+					: "the model returned no text (it stopped without writing the summary)";
+			}
+			return null;
 		};
-		validateResponse(response);
-		if (hasToolCall(response) && !contentText(response.content).trim()) {
-			response = await retryAssistantCall(produce, retryPolicy, signal);
-			validateResponse(response);
+		const attempts: Array<{ attempt: number; response: AssistantMessage; problem?: string }> = [];
+		const fail = (detail: string): never => {
+			const path = writeSummarizationFailureLog(
+				ctx.sessionManager.getSessionId(),
+				model,
+				thinkingChoice,
+				ctx.thinkingLevel,
+				attempts,
+			);
+			throw new Error(
+				`Summarization failed after ${attempts.length} attempt${attempts.length === 1 ? "" : "s"}: ${detail}; ` +
+					`model output saved to ${path} (pi falls back to built-in compaction)`,
+			);
+		};
+		let response: AssistantMessage | undefined;
+		for (let attempt = 1; attempt <= MAX_SUMMARIZATION_ATTEMPTS; attempt++) {
+			// The provider-level retry policy (settings.retry.*) still applies
+			// inside every attempt for transient stream errors.
+			const candidate = await retryAssistantCall(
+				() => produce(buildRequestContext(attempt > 1)),
+				retryPolicy,
+				signal,
+			);
+			if (candidate.stopReason === "aborted") {
+				throw new Error("Compaction aborted"); // user-initiated — no retry, no diagnostics
+			}
+			if (candidate.stopReason === "error") {
+				// retryAssistantCall already spent the configured policy on
+				// transient provider errors; don't spend it again here.
+				attempts.push({ attempt, response: candidate });
+				fail(candidate.errorMessage || "Unknown error");
+			}
+			const problem = contentProblem(candidate);
+			if (!problem) {
+				response = candidate;
+				break;
+			}
+			attempts.push({ attempt, response: candidate, problem });
+			if (attempt === MAX_SUMMARIZATION_ATTEMPTS) {
+				fail(problem);
+			}
 		}
-		const summaryText = contentText(response.content).trim();
-		if (hasToolCall(response) && !summaryText) {
-			throw new Error("Summarization attempted to call a tool");
+		if (!response) {
+			// Unreachable: the loop only exits without a response via fail().
+			throw new Error("Summarization failed without a result");
 		}
-		if (!summaryText) {
-			throw new Error("Summarization returned no text");
-		}
+		const summaryText = summaryTextOf(response);
 
 		// 5. Same cumulative file tracking as the built-in compaction.
 		const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
 		const summary = summaryText + formatFileOperations(readFiles, modifiedFiles);
 
 		// 6. Stash the report (measured on the final attempt — `timing` is
-		//    rewritten by every produce() call, so after the validation/retry
+		//    rewritten by every produce() call, so after the summarization/retry
 		//    step above it holds the final attempt's numbers, not a partial or
 		//    pre-validation value) for the session_compact event. It must NOT
 		//    be emitted here: session_before_compact runs before pi applies the
